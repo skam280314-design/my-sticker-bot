@@ -1,20 +1,8 @@
-import libsql_experimental as libsql
 import os
 import io
 import re
 import time
-import libsql_experimental as libsql
-...
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
-
-def db():
-    con = libsql.connect(
-        database=TURSO_URL,
-        auth_token=TURSO_TOKEN,
-    )
-    con.row_factory = sqlite3.Row
-    return con
+import sqlite3
 import logging
 import tempfile
 import gzip
@@ -105,10 +93,20 @@ def _category_dir(key: str) -> Path:
 
 
 def _category_templates(key: str):
+    """Сортировка по числу в имени файла (001, 002, ..., 010, 011)."""
     d = _category_dir(key)
     if not d.exists():
         return []
-    return [(p.stem, p) for p in sorted(d.glob("*.tgs"))]
+    files = list(d.glob("*.tgs"))
+
+    def sort_key(p):
+        m = re.search(r"(\d+)", p.stem)
+        if m:
+            return (0, int(m.group(1)), p.stem)
+        return (1, 0, p.stem)
+
+    files.sort(key=sort_key)
+    return [(p.stem, p) for p in files]
 
 
 def _category_info(key: str):
@@ -121,12 +119,62 @@ def _category_info(key: str):
 # ─── БД ─────────────────────────────────────────────────────────────────────
 
 def db_init():
-    con = db()
-    con.execute("""CREATE TABLE IF NOT EXISTS users (...)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS sets (...)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS stats (...)""")
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT,
+            first_name  TEXT,
+            balance     INTEGER NOT NULL DEFAULT 0,
+            generated   INTEGER NOT NULL DEFAULT 0,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(users)").fetchall()}
+    if "generated" not in cols:
+        con.execute("ALTER TABLE users ADD COLUMN generated INTEGER NOT NULL DEFAULT 0")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS sets (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            path        TEXT NOT NULL,
+            text        TEXT,
+            template    TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS stats (
+            key   TEXT PRIMARY KEY,
+            value INTEGER NOT NULL DEFAULT 0
+        )
+    """)
     con.commit()
     con.close()
+
+
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def remember_user(user):
+    if user is None:
+        return
+    con = db()
+    try:
+        con.execute("""
+            INSERT INTO users (user_id, username, first_name, balance)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name
+        """, (user.id, user.username or "", user.first_name or ""))
+        con.commit()
+    finally:
+        con.close()
 
 
 def find_user_by_username(username: str):
