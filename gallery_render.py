@@ -1,11 +1,11 @@
 """
 Рендер .tgs (Lottie) в PNG + сборка коллажа в стиле emoji-галереи.
+БЕЗ КЭША — каждый раз рендерит заново, чтобы превью совпадало с выдачей.
 """
 
 import os
 import gzip
 import json
-import hashlib
 import tempfile
 import logging
 from pathlib import Path
@@ -25,31 +25,27 @@ except Exception as e:
 
 # ─── Настройки ──────────────────────────────────────────────────────────────
 
-CELL_PX      = 200       # размер ячейки (квадрат)
-PAD_PX       = 12        # отступ между ячейками
-MARGIN_PX    = 20        # внешние поля
-RADIUS       = 18        # радиус скругления карточек
+CELL_PX      = 200
+PAD_PX       = 12
+MARGIN_PX    = 20
+RADIUS       = 18
 
-# Стиль (светлый, как у @emojicreationbot)
-BG_COLOR     = (255, 255, 255)   # белый фон вокруг
-CELL_BG      = (168, 168, 168)   # серый фон карточек
-BADGE_BG     = (30, 30, 30)      # тёмный круг с номером
-BADGE_TEXT   = (255, 255, 255)   # белый текст номера
-BADGE_R      = 22                # радиус круга номера
+BG_COLOR     = (255, 255, 255)
+CELL_BG      = (168, 168, 168)
+BADGE_BG     = (30, 30, 30)
+BADGE_TEXT   = (255, 255, 255)
+BADGE_R      = 22
 
 COLS = 4
 ROWS = 3
-MAX_PER_PAGE = COLS * ROWS       # 12
-
-CACHE_DIR = Path(__file__).parent / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
+MAX_PER_PAGE = COLS * ROWS   # 12
 
 
 # ─── Шрифт ──────────────────────────────────────────────────────────────────
 
 def _load_label_font(size: int = 22):
     candidates = [
-        "C:/Windows/Fonts/arialbd.ttf",   # Arial Bold
+        "C:/Windows/Fonts/arialbd.ttf",
         "C:/Windows/Fonts/arial.ttf",
         "C:/Windows/Fonts/segoeuib.ttf",
         "arial.ttf",
@@ -62,8 +58,6 @@ def _load_label_font(size: int = 22):
     return ImageFont.load_default()
 
 
-# ─── Заглушка, если кадр не отрендерился ────────────────────────────────────
-
 def _placeholder_cell(size: int = CELL_PX) -> Image.Image:
     img = Image.new("RGB", (size, size), CELL_BG)
     d = ImageDraw.Draw(img)
@@ -73,27 +67,12 @@ def _placeholder_cell(size: int = CELL_PX) -> Image.Image:
     return img
 
 
-# ─── Рендер одного .tgs в PNG (с кэшем) ─────────────────────────────────────
-
-def _frame_cache_path(tgs_path: Path, frame_index: int, size: int) -> Path:
-    h = hashlib.md5(
-        f"{tgs_path.name}:{tgs_path.stat().st_mtime}:{frame_index}:{size}".encode()
-    ).hexdigest()[:16]
-    return CACHE_DIR / f"frame_{h}.png"
-
+# ─── Рендер одного .tgs в PNG (без кэша) ────────────────────────────────────
 
 def render_tgs_frame(tgs_path: Path, out_png: Path,
                      size: int = CELL_PX, frame_index: int = 0) -> bool:
     if not _HAS_RLOTTIE:
         return False
-
-    cached = _frame_cache_path(tgs_path, frame_index, size)
-    if cached.exists():
-        try:
-            Image.open(cached).save(out_png, "PNG")
-            return True
-        except Exception:
-            pass
 
     try:
         with open(tgs_path, "rb") as f:
@@ -134,18 +113,12 @@ def render_tgs_frame(tgs_path: Path, out_png: Path,
             img = img.convert("RGBA")
             img.thumbnail((size, size), Image.LANCZOS)
 
-            # Прозрачный фон (чтобы лёг на серую карточку)
             canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
             ox = (size - img.width) // 2
             oy = (size - img.height) // 2
             canvas.paste(img, (ox, oy), img)
 
             canvas.save(out_png, "PNG", optimize=True)
-
-            try:
-                canvas.save(cached, "PNG", optimize=True)
-            except Exception:
-                pass
             return True
         finally:
             try:
@@ -157,21 +130,9 @@ def render_tgs_frame(tgs_path: Path, out_png: Path,
         return False
 
 
-# ─── Сборка коллажа ─────────────────────────────────────────────────────────
-
-def _page_cache_path(paths, page_number: int, total_pages: int) -> Path:
-    parts = [f"p{page_number}/{total_pages}"]
-    for p in paths:
-        try:
-            parts.append(f"{p.name}:{p.stat().st_mtime}")
-        except OSError:
-            parts.append(p.name)
-    h = hashlib.md5("|".join(parts).encode()).hexdigest()[:16]
-    return CACHE_DIR / f"page_{h}.png"
-
+# ─── Сборка коллажа (БЕЗ КЭША) ──────────────────────────────────────────────
 
 def _rounded_rect(draw, box, radius, fill):
-    """Рисует закруглённый прямоугольник."""
     x1, y1, x2, y2 = box
     r = radius
     draw.rectangle([x1 + r, y1, x2 - r, y2], fill=fill)
@@ -186,15 +147,14 @@ def make_gallery_image(tgs_paths: list,
                        page_number: int = 1,
                        total_pages: int = 1,
                        out_path: Path | None = None) -> Path | None:
+    """
+    Собирает коллаж. Кэш НЕ используется — всегда рендерит заново.
+    """
     if out_path is None:
-        cached = _page_cache_path(tgs_paths, page_number, total_pages)
-        if cached.exists():
-            return cached
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         out_path = Path(tmp.name)
         tmp.close()
 
-    # Размеры итогового изображения
     W = MARGIN_PX * 2 + COLS * CELL_PX + (COLS - 1) * PAD_PX
     H = MARGIN_PX * 2 + ROWS * CELL_PX + (ROWS - 1) * PAD_PX
 
@@ -210,16 +170,13 @@ def make_gallery_image(tgs_paths: list,
         x = MARGIN_PX + col * (CELL_PX + PAD_PX)
         y = MARGIN_PX + row * (CELL_PX + PAD_PX)
 
-        # Серая карточка со скруглёнными углами
         _rounded_rect(draw, [x, y, x + CELL_PX, y + CELL_PX], RADIUS, CELL_BG)
 
-        # Рендер превью (если есть файл)
         if i < len(tgs_paths):
             tmp_cell = out_path.parent / f"_cell_{os.getpid()}_{i}.png"
             ok = render_tgs_frame(tgs_paths[i], tmp_cell, size=int(CELL_PX * 0.75))
             if ok and tmp_cell.exists():
                 cell_img = Image.open(tmp_cell).convert("RGBA")
-                # Центрируем картинку в карточке
                 cw, ch = cell_img.size
                 ox = x + (CELL_PX - cw) // 2
                 oy = y + (CELL_PX - ch) // 2
@@ -237,7 +194,6 @@ def make_gallery_image(tgs_paths: list,
                 except OSError:
                     pass
 
-        # Круг с номером (левый верхний угол)
         badge_cx = x + BADGE_R + 4
         badge_cy = y + BADGE_R + 4
         draw.ellipse(
@@ -255,15 +211,6 @@ def make_gallery_image(tgs_paths: list,
         )
 
     canvas.save(out_path, "PNG", optimize=True)
-
-    # Кэш
-    if out_path.parent != CACHE_DIR:
-        try:
-            cached = _page_cache_path(tgs_paths, page_number, total_pages)
-            canvas.save(cached, "PNG", optimize=True)
-        except Exception:
-            pass
-
     return out_path
 
 
