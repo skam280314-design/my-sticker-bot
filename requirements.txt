@@ -1,0 +1,7 @@
+python-telegram-bot>=20.0
+python-dotenv
+fonttools
+Pillow
+rlottie-python
+httpx
+Flask
