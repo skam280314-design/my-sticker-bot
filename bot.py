@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TELEGRAM_TOKEN") or "8710441127:AAGFenboPwsVFxyMd6KxkK68HHagwEVcH1I"
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 ADMIN_ID = 8572202921
 
@@ -402,12 +402,7 @@ def _admin_keyboard():
 
 
 def _gallery_keyboard(cat: str, page: int, total_pages: int, count_on_page: int):
-    """
-    Сетка шаблонов + строка навигации: стрелки + номера страниц рядом.
-    """
     rows = []
-
-    # Сетка шаблонов (4 в ряд)
     row = []
     for i in range(count_on_page):
         row.append(InlineKeyboardButton(
@@ -418,24 +413,20 @@ def _gallery_keyboard(cat: str, page: int, total_pages: int, count_on_page: int)
     if row:
         rows.append(row)
 
-    # Навигация: [⬅️] [1] [2] [·3·] [4] [5] [➡️]
     nav = []
-
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"cat:{cat}:{page-1}"))
 
-    # Показываем до 5 номеров вокруг текущей
     start = max(0, page - 2)
     end = min(total_pages, start + 5)
     start = max(0, end - 5)
 
     for p in range(start, end):
         if p == page:
-            nav.append(InlineKeyboardButton(
-                f"· {p+1} ·", callback_data="noop"))
+            nav.append(InlineKeyboardButton(f"· {p+1} ·", callback_data="noop"))
         else:
-            nav.append(InlineKeyboardButton(
-                str(p + 1), callback_data=f"cat:{cat}:{p}"))
+            nav.append(InlineKeyboardButton(str(p + 1),
+                                            callback_data=f"cat:{cat}:{p}"))
 
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton("➡️", callback_data=f"cat:{cat}:{page+1}"))
@@ -445,6 +436,8 @@ def _gallery_keyboard(cat: str, page: int, total_pages: int, count_on_page: int)
 
     rows.append([InlineKeyboardButton("🏠 В меню", callback_data="main")])
     return InlineKeyboardMarkup(rows)
+
+
 def _color_keyboard(target: str):
     rows = []
     row = []
@@ -1374,7 +1367,7 @@ async def on_error(update, ctx):
 
 def main():
     if not TOKEN:
-        raise ValueError("Укажи TELEGRAM_TOKEN в .env")
+        raise ValueError("Укажи TELEGRAM_TOKEN в переменных окружения")
 
     db_init()
 
