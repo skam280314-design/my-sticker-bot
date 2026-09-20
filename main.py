@@ -10,12 +10,14 @@ app = Flask(__name__)
 def health_check():
     return "Bot is running!", 200
 
-def run_bot():
-    start_bot()
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    # Flask — в фоне (в отдельном потоке)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    # Бот — в основном потоке (иначе set_wakeup_fd не работает)
+    start_bot()
