@@ -2,6 +2,8 @@ import os
 import io
 import re
 import time
+import random
+import string
 import sqlite3
 import logging
 import tempfile
@@ -93,7 +95,6 @@ def _category_dir(key: str) -> Path:
 
 
 def _category_templates(key: str):
-    """Сортировка по числу в имени файла (001, 002, ..., 010, 011)."""
     d = _category_dir(key)
     if not d.exists():
         return []
@@ -148,6 +149,25 @@ def db_init():
         CREATE TABLE IF NOT EXISTS stats (
             key   TEXT PRIMARY KEY,
             value INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    # Промокоды
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS promocodes (
+            code        TEXT PRIMARY KEY,
+            stars       INTEGER NOT NULL,
+            max_uses    INTEGER NOT NULL DEFAULT 0,
+            used_count  INTEGER NOT NULL DEFAULT 0,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Кто активировал какой промокод
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS promo_uses (
+            code        TEXT NOT NULL,
+            user_id     INTEGER NOT NULL,
+            used_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (code, user_id)
         )
     """)
     con.commit()
@@ -324,6 +344,91 @@ def clear_sets(user_id: int):
         con.close()
 
 
+# ─── Промокоды ──────────────────────────────────────────────────────────────
+
+def promo_create(code: str, stars: int, max_uses: int = 0):
+    con = db()
+    try:
+        con.execute("""
+            INSERT INTO promocodes (code, stars, max_uses, used_count)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(code) DO UPDATE SET
+                stars = excluded.stars,
+                max_uses = excluded.max_uses
+        """, (code, stars, max_uses))
+        con.commit()
+    finally:
+        con.close()
+
+
+def promo_delete(code: str) -> bool:
+    con = db()
+    try:
+        cur = con.execute("DELETE FROM promocodes WHERE code = ?", (code,))
+        con.execute("DELETE FROM promo_uses WHERE code = ?", (code,))
+        con.commit()
+        return cur.rowcount > 0
+    finally:
+        con.close()
+
+
+def promo_get(code: str):
+    con = db()
+    try:
+        return con.execute("SELECT * FROM promocodes WHERE code = ?", (code,)).fetchone()
+    finally:
+        con.close()
+
+
+def promo_list():
+    con = db()
+    try:
+        return con.execute("SELECT * FROM promocodes ORDER BY created_at DESC").fetchall()
+    finally:
+        con.close()
+
+
+def promo_user_used(code: str, user_id: int) -> bool:
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT 1 FROM promo_uses WHERE code = ? AND user_id = ? LIMIT 1",
+            (code, user_id)
+        ).fetchone()
+        return row is not None
+    finally:
+        con.close()
+
+
+def promo_apply(code: str, user_id: int) -> tuple[bool, str]:
+    """Пытается применить промокод. Возвращает (успех, сообщение)."""
+    con = db()
+    try:
+        row = con.execute("SELECT * FROM promocodes WHERE code = ?", (code,)).fetchone()
+        if not row:
+            return False, "❌ Такого промокода нет."
+        if promo_user_used(code, user_id):
+            return False, "❌ Ты уже использовал этот промокод."
+        if row["max_uses"] > 0 and row["used_count"] >= row["max_uses"]:
+            return False, "❌ Промокод больше не действует (лимит исчерпан)."
+
+        con.execute("UPDATE promocodes SET used_count = used_count + 1 WHERE code = ?",
+                    (code,))
+        con.execute("INSERT INTO promo_uses (code, user_id) VALUES (?, ?)",
+                    (code, user_id))
+        con.commit()
+        stars = row["stars"]
+        add_balance(user_id, stars)
+        return True, f"✅ Промокод активирован! +{stars} ⭐"
+    finally:
+        con.close()
+
+
+def gen_random_code(length: int = 8) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(random.choice(alphabet) for _ in range(length))
+
+
 # ─── Утилиты ────────────────────────────────────────────────────────────────
 
 def is_admin(user_id: int) -> bool:
@@ -390,6 +495,7 @@ def _main_menu(user_id: int):
                 callback_data=f"cat:{key}:0"
             )])
 
+    rows.append([InlineKeyboardButton("🎟 Активировать промокод", callback_data="promo_enter")])
     rows.append([InlineKeyboardButton("📦 Ваши стикеры", callback_data="my_sets")])
     rows.append([InlineKeyboardButton("⭐ Пополнить",    callback_data="topup")])
     rows.append([InlineKeyboardButton("ℹ️ Помощь",       callback_data="help")])
@@ -406,8 +512,27 @@ def _admin_keyboard():
         [InlineKeyboardButton("⭐ Выдать звёзды", callback_data="adm_give_stars")],
         [InlineKeyboardButton("👥 Пользователи", callback_data="adm_users")],
         [InlineKeyboardButton("📢 Рассылка", callback_data="adm_broadcast")],
+        [InlineKeyboardButton("🎟 Промокоды", callback_data="adm_promo")],
         [InlineKeyboardButton("📁 Файлы shared", callback_data="adm_files")],
         [InlineKeyboardButton("🏠 В меню", callback_data="main")],
+    ])
+
+
+def _promo_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Создать промокод", callback_data="adm_promo_create")],
+        [InlineKeyboardButton("📋 Список промокодов", callback_data="adm_promo_list")],
+        [InlineKeyboardButton("🗑 Удалить промокод", callback_data="adm_promo_delete")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin")],
+    ])
+
+
+def _give_stars_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Одному пользователю", callback_data="adm_give_one")],
+        [InlineKeyboardButton("👥 Нескольким", callback_data="adm_give_many")],
+        [InlineKeyboardButton("🌐 Всем пользователям", callback_data="adm_give_all")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin")],
     ])
 
 
@@ -542,6 +667,176 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("❌ Сначала подпишитесь на канал", show_alert=True)
         return
 
+    # ─── Промокод: ввод ─────────────────────────────────────────────────────
+    if data == "promo_enter":
+        await q.answer()
+        ctx.user_data["awaiting_promo"] = True
+        await q.message.reply_text(
+            "🎟 <b>Активация промокода</b>\n\n"
+            "Введи промокод одним сообщением:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Отмена", callback_data="main")]]))
+        return
+
+    # ─── Админка ────────────────────────────────────────────────────────────
+    if data.startswith("adm") or data == "admin":
+        if not is_admin(user_id):
+            await q.answer("❌ Нет доступа", show_alert=True)
+            return
+        await q.answer()
+
+        if data == "admin":
+            await q.message.reply_text("🛠 <b>Админ-панель</b>",
+                                       parse_mode="HTML",
+                                       reply_markup=_admin_keyboard())
+            return
+
+        if data == "adm_stats":
+            lines = ["📊 <b>Статистика</b>\n"]
+            lines.append(f"👥 Пользователей: <b>{count_users()}</b>")
+            lines.append(f"🎨 Сгенерировано: <b>{stat_get('generated')}</b>")
+            lines.append(f"💳 Платежей: <b>{stat_get('payments')}</b>")
+            lines.append(f"⭐ Звёзд: <b>{stat_get('stars')}</b>\n")
+            lines.append("📁 <b>Категории:</b>")
+            for key, emoji, name in CATEGORIES:
+                cnt = len(_category_templates(key))
+                lines.append(f"  {emoji} {name}: {cnt}")
+            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                       reply_markup=_admin_keyboard())
+            return
+
+        if data == "adm_users":
+            rows = list_users(50)
+            if not rows:
+                await q.message.reply_text("👥 Пользователей пока нет.",
+                                           reply_markup=_admin_keyboard())
+                return
+            lines = ["👥 <b>Пользователи</b>\n"]
+            for r in rows:
+                uname = f"@{r['username']}" if r["username"] else "—"
+                lines.append(f"• <code>{r['user_id']}</code> · {uname} · "
+                             f"{r['first_name'] or ''} · ⭐ {r['balance']}")
+            if count_users() > 50:
+                lines.append(f"\n…и ещё {count_users() - 50}")
+            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                       reply_markup=_admin_keyboard())
+            return
+
+        # ─── Выдача звёзд: выбор режима ─────────────────────────────────────
+        if data == "adm_give_stars":
+            await q.message.reply_text(
+                "⭐ <b>Выдача звёзд</b>\n\nВыбери режим:",
+                parse_mode="HTML",
+                reply_markup=_give_stars_keyboard())
+            return
+
+        if data == "adm_give_one":
+            ctx.user_data["awaiting_give_stars"] = "one"
+            await q.message.reply_text(
+                "👤 <b>Одному пользователю</b>\n\n"
+                "Отправь: <code>@username 100</code> или <code>123456789 100</code>\n"
+                "Отрицательное число — списать.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛠 Отмена", callback_data="admin")]]))
+            return
+
+        if data == "adm_give_many":
+            ctx.user_data["awaiting_give_stars"] = "many"
+            await q.message.reply_text(
+                "👥 <b>Нескольким пользователям</b>\n\n"
+                "Отправь в формате:\n"
+                "<code>@user1,@user2,@user3 100</code>\n"
+                "или\n"
+                "<code>123,456,789 100</code>\n\n"
+                "Отрицательное число — списать.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛠 Отмена", callback_data="admin")]]))
+            return
+
+        if data == "adm_give_all":
+            ctx.user_data["awaiting_give_stars"] = "all"
+            await q.message.reply_text(
+                "🌐 <b>Всем пользователям</b>\n\n"
+                "Отправь число — сколько ⭐ выдать каждому.\n"
+                "Отрицательное — списать у всех.\n\n"
+                "Пример: <code>5</code> — выдаст 5 ⭐ каждому.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛠 Отмена", callback_data="admin")]]))
+            return
+
+        # ─── Промокоды ──────────────────────────────────────────────────────
+        if data == "adm_promo":
+            await q.message.reply_text(
+                "🎟 <b>Промокоды</b>\n\nУправление:",
+                parse_mode="HTML",
+                reply_markup=_promo_keyboard())
+            return
+
+        if data == "adm_promo_create":
+            ctx.user_data["awaiting_promo_create"] = True
+            await q.message.reply_text(
+                "➕ <b>Создание промокода</b>\n\n"
+                "Отправь в формате:\n"
+                "<code>КОД ЗВЁЗДЫ [ЛИМИТ]</code>\n\n"
+                "Примеры:\n"
+                "<code>HELLO 10</code> — код HELLO на 10 ⭐, без лимита\n"
+                "<code>SUMMER 20 100</code> — код SUMMER на 20 ⭐, только 100 активаций\n\n"
+                "Если хочешь случайный код — отправь <code>random 10</code>.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛠 Отмена", callback_data="adm_promo")]]))
+            return
+
+        if data == "adm_promo_list":
+            rows = promo_list()
+            if not rows:
+                await q.message.reply_text("📋 Промокодов пока нет.",
+                                           reply_markup=_promo_keyboard())
+                return
+            lines = ["📋 <b>Промокоды</b>\n"]
+            for r in rows[:30]:
+                max_u = r["max_uses"] or "∞"
+                lines.append(
+                    f"• <code>{r['code']}</code> — {r['stars']} ⭐ · "
+                    f"{r['used_count']}/{max_u}")
+            if len(rows) > 30:
+                lines.append(f"\n…и ещё {len(rows) - 30}")
+            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                       reply_markup=_promo_keyboard())
+            return
+
+        if data == "adm_promo_delete":
+            ctx.user_data["awaiting_promo_delete"] = True
+            await q.message.reply_text(
+                "🗑 <b>Удаление промокода</b>\n\n"
+                "Отправь код, который нужно удалить.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛠 Отмена", callback_data="adm_promo")]]))
+            return
+
+        if data == "adm_broadcast":
+            ctx.user_data["awaiting_broadcast"] = True
+            await q.message.reply_text(
+                "📢 Напиши текст рассылки.\n\nОтмена: /cancel",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛠 Отмена", callback_data="admin")]]))
+            return
+
+        if data == "adm_files":
+            lines = ["📁 <b>Файлы shared/</b>\n"]
+            for key, emoji, name in CATEGORIES:
+                d = _category_dir(key)
+                cnt = len(list(d.glob("*.tgs"))) if d.exists() else 0
+                lines.append(f"{emoji} <b>{name}</b> (<code>{key}</code>): {cnt}")
+            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                       reply_markup=_admin_keyboard())
+            return
+
     if data.startswith("pick_color:"):
         await q.answer()
         target = data.split(":", 1)[1]
@@ -599,78 +894,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             update, ctx, q.message, text, template_path, colors=colors
         )
         return
-
-    if data.startswith("adm") or data == "admin":
-        if not is_admin(user_id):
-            await q.answer("❌ Нет доступа", show_alert=True)
-            return
-        await q.answer()
-
-        if data == "admin":
-            await q.message.reply_text("🛠 <b>Админ-панель</b>",
-                                       parse_mode="HTML",
-                                       reply_markup=_admin_keyboard())
-            return
-
-        if data == "adm_stats":
-            lines = ["📊 <b>Статистика</b>\n"]
-            lines.append(f"👥 Пользователей: <b>{count_users()}</b>")
-            lines.append(f"🎨 Сгенерировано: <b>{stat_get('generated')}</b>")
-            lines.append(f"💳 Платежей: <b>{stat_get('payments')}</b>")
-            lines.append(f"⭐ Звёзд: <b>{stat_get('stars')}</b>\n")
-            lines.append("📁 <b>Категории:</b>")
-            for key, emoji, name in CATEGORIES:
-                cnt = len(_category_templates(key))
-                lines.append(f"  {emoji} {name}: {cnt}")
-            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
-                                       reply_markup=_admin_keyboard())
-            return
-
-        if data == "adm_users":
-            rows = list_users(50)
-            if not rows:
-                await q.message.reply_text("👥 Пользователей пока нет.",
-                                           reply_markup=_admin_keyboard())
-                return
-            lines = ["👥 <b>Пользователи</b>\n"]
-            for r in rows:
-                uname = f"@{r['username']}" if r["username"] else "—"
-                lines.append(f"• <code>{r['user_id']}</code> · {uname} · "
-                             f"{r['first_name'] or ''} · ⭐ {r['balance']}")
-            if count_users() > 50:
-                lines.append(f"\n…и ещё {count_users() - 50}")
-            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
-                                       reply_markup=_admin_keyboard())
-            return
-
-        if data == "adm_give_stars":
-            ctx.user_data["awaiting_give_stars"] = True
-            await q.message.reply_text(
-                "⭐ <b>Выдать звёзды</b>\n\n"
-                "Отправь: <code>@username 100</code> или <code>123456789 100</code>\n"
-                "Отрицательное — списать.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🛠 Отмена", callback_data="admin")]]))
-            return
-
-        if data == "adm_broadcast":
-            ctx.user_data["awaiting_broadcast"] = True
-            await q.message.reply_text(
-                "📢 Напиши текст рассылки.\n\nОтмена: /cancel",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🛠 Отмена", callback_data="admin")]]))
-            return
-
-        if data == "adm_files":
-            lines = ["📁 <b>Файлы shared/</b>\n"]
-            for key, emoji, name in CATEGORIES:
-                d = _category_dir(key)
-                cnt = len(list(d.glob("*.tgs"))) if d.exists() else 0
-                lines.append(f"{emoji} <b>{name}</b> (<code>{key}</code>): {cnt}")
-            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
-                                       reply_markup=_admin_keyboard())
-            return
 
     if data.startswith("cat:"):
         try:
@@ -841,7 +1064,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "2. Выбери шаблон\n"
             "3. Напиши текст (до 12 символов)\n"
             "4. В «Перекраске» выбери цвета для фона, персонажа, контура, текста\n"
-            f"5. Получи стикер за {PRICE_STARS} ⭐",
+            f"5. Получи стикер за {PRICE_STARS} ⭐\n\n"
+            "🎟 Есть промокод? Нажми «Активировать промокод» в меню.",
             parse_mode="HTML", reply_markup=_back_menu())
         return
 
@@ -1177,6 +1401,9 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("awaiting_topup", None)
     ctx.user_data.pop("awaiting_broadcast", None)
     ctx.user_data.pop("awaiting_give_stars", None)
+    ctx.user_data.pop("awaiting_promo", None)
+    ctx.user_data.pop("awaiting_promo_create", None)
+    ctx.user_data.pop("awaiting_promo_delete", None)
     ctx.user_data.pop("pending_text", None)
     ctx.user_data.pop("recolor_colors", None)
     await update.message.reply_text(
@@ -1200,67 +1427,179 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     remember_user(user)
     user_id = user.id
+    text = update.message.text.strip()
+    logger.info("HANDLER: text=%r", text)
 
-    if ctx.user_data.get("awaiting_give_stars") and is_admin(user_id):
-        ctx.user_data["awaiting_give_stars"] = False
-        parts = update.message.text.strip().split()
+    # ─── Пользователь вводит промокод ───────────────────────────────────────
+    if ctx.user_data.get("awaiting_promo"):
+        ctx.user_data["awaiting_promo"] = False
+        code = text.upper().strip()
+        ok, msg = promo_apply(code, user_id)
+        await update.message.reply_text(
+            msg,
+            reply_markup=_main_menu(user_id))
+        return
+
+    # ─── Админ создаёт промокод ─────────────────────────────────────────────
+    if ctx.user_data.get("awaiting_promo_create") and is_admin(user_id):
+        ctx.user_data["awaiting_promo_create"] = False
+        parts = text.split()
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "❌ Формат: <code>КОД ЗВЁЗДЫ [ЛИМИТ]</code>",
+                parse_mode="HTML", reply_markup=_promo_keyboard())
+            return
+        code = parts[0].upper()
+        if code.lower() == "random":
+            code = gen_random_code()
+        try:
+            stars = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("❌ Звёзды должны быть числом.",
+                                            reply_markup=_promo_keyboard())
+            return
+        limit = 0
+        if len(parts) >= 3:
+            try:
+                limit = int(parts[2])
+            except ValueError:
+                limit = 0
+        promo_create(code, stars, limit)
+        max_u = limit or "∞"
+        await update.message.reply_text(
+            f"✅ Промокод создан:\n\n"
+            f"<b>Код:</b> <code>{code}</code>\n"
+            f"<b>Звёзд:</b> {stars} ⭐\n"
+            f"<b>Лимит:</b> {max_u}",
+            parse_mode="HTML", reply_markup=_promo_keyboard())
+        return
+
+    # ─── Админ удаляет промокод ─────────────────────────────────────────────
+    if ctx.user_data.get("awaiting_promo_delete") and is_admin(user_id):
+        ctx.user_data["awaiting_promo_delete"] = False
+        code = text.upper().strip()
+        if promo_delete(code):
+            await update.message.reply_text(
+                f"🗑 Промокод <code>{code}</code> удалён.",
+                parse_mode="HTML", reply_markup=_promo_keyboard())
+        else:
+            await update.message.reply_text(
+                f"❌ Промокод <code>{code}</code> не найден.",
+                parse_mode="HTML", reply_markup=_promo_keyboard())
+        return
+
+    # ─── Массовая выдача звёзд ──────────────────────────────────────────────
+    mode = ctx.user_data.get("awaiting_give_stars")
+    if mode and is_admin(user_id):
+        # all — только число
+        if mode == "all":
+            ctx.user_data["awaiting_give_stars"] = None
+            if not text.lstrip("-").isdigit():
+                await update.message.reply_text("❌ Нужно число.",
+                                                reply_markup=_admin_keyboard())
+                return
+            amount = int(text)
+            uids = get_all_user_ids()
+            ok = 0
+            for uid in uids:
+                try:
+                    add_balance(uid, amount)
+                    ok += 1
+                except Exception:
+                    pass
+            await update.message.reply_text(
+                f"✅ Выдано по {amount} ⭐ всем пользователям ({ok} чел.).",
+                reply_markup=_admin_keyboard())
+            return
+
+        # one / many — формат "@user1,@user2 100"
+        ctx.user_data["awaiting_give_stars"] = None
+        parts = text.split()
         if len(parts) != 2:
             await update.message.reply_text(
-                "❌ Формат: <code>@username 100</code> или <code>123456789 100</code>",
+                "❌ Формат: <code>@user1,@user2 100</code>\n"
+                "или <code>123,456 100</code>",
                 parse_mode="HTML", reply_markup=_admin_keyboard())
             return
 
-        target_raw, amount_raw = parts
+        targets_raw, amount_raw = parts
         try:
             amount = int(amount_raw)
         except ValueError:
             await update.message.reply_text("❌ Сумма должна быть числом.",
                                             reply_markup=_admin_keyboard())
             return
-
         if amount == 0:
             await update.message.reply_text("❌ Сумма не может быть 0.",
                                             reply_markup=_admin_keyboard())
             return
 
-        if target_raw.startswith("@") or not target_raw.isdigit():
-            target_id = find_user_by_username(target_raw)
-            if target_id is None:
-                await update.message.reply_text(
-                    f"❌ Пользователь <code>{target_raw}</code> не найден.\n"
-                    f"<i>Он должен хоть раз написать боту /start.</i>",
-                    parse_mode="HTML", reply_markup=_admin_keyboard())
-                return
-            display = target_raw
-        else:
-            target_id = int(target_raw)
-            display = f"<code>{target_id}</code>"
+        targets = [t.strip() for t in targets_raw.split(",") if t.strip()]
+        if not targets:
+            await update.message.reply_text("❌ Укажи хотя бы одного пользователя.",
+                                            reply_markup=_admin_keyboard())
+            return
 
-        add_balance(target_id, amount)
-        action = "Выдано" if amount > 0 else "Списано"
-        new_bal = get_balance(target_id)
-        await update.message.reply_text(
-            f"✅ {action} {abs(amount)} ⭐ → {display}\n"
-            f"Баланс: <b>{new_bal}</b> ⭐",
-            parse_mode="HTML", reply_markup=_admin_keyboard())
+        ok_list = []
+        fail_list = []
 
-        if target_id != user_id:
-            try:
-                if amount > 0:
-                    await ctx.bot.send_message(
-                        target_id,
-                        f"🎁 Зачислено {amount} ⭐!\nБаланс: {new_bal} ⭐")
-                else:
-                    await ctx.bot.send_message(
-                        target_id,
-                        f"⚠️ Списано {-amount} ⭐.\nБаланс: {new_bal} ⭐")
-            except Exception:
-                pass
+        for t in targets:
+            uid = None
+            display = t
+            if t.startswith("@") or not t.isdigit():
+                uid = find_user_by_username(t)
+                if uid is None:
+                    fail_list.append(t)
+                    continue
+            else:
+                try:
+                    uid = int(t)
+                except ValueError:
+                    fail_list.append(t)
+                    continue
+                info_username = None
+                con = db()
+                try:
+                    row = con.execute("SELECT username, first_name FROM users WHERE user_id = ?",
+                                      (uid,)).fetchone()
+                    if row:
+                        if row["username"]:
+                            info_username = f"@{row['username']}"
+                        else:
+                            info_username = row["first_name"] or str(uid)
+                finally:
+                    con.close()
+                if info_username:
+                    display = info_username
+
+            add_balance(uid, amount)
+            ok_list.append(f"{display} ({amount:+d}⭐)")
+
+            # Уведомление
+            if uid != user_id:
+                try:
+                    if amount > 0:
+                        await ctx.bot.send_message(
+                            uid, f"🎁 Зачислено {amount} ⭐!\nБаланс: {get_balance(uid)} ⭐")
+                    else:
+                        await ctx.bot.send_message(
+                            uid, f"⚠️ Списано {-amount} ⭐.\nБаланс: {get_balance(uid)} ⭐")
+                except Exception:
+                    pass
+
+        reply = ""
+        if ok_list:
+            reply += "✅ <b>Обработано:</b>\n" + "\n".join(ok_list)
+        if fail_list:
+            reply += "\n\n❌ <b>Не найдены:</b>\n" + "\n".join(fail_list)
+        await update.message.reply_text(reply or "Ничего не сделано.",
+                                        parse_mode="HTML",
+                                        reply_markup=_admin_keyboard())
         return
 
+    # ─── Рассылка ───────────────────────────────────────────────────────────
     if ctx.user_data.get("awaiting_broadcast") and is_admin(user_id):
         ctx.user_data["awaiting_broadcast"] = False
-        text = update.message.text.strip()
         sent, failed = 0, 0
         for uid in get_all_user_ids():
             try:
@@ -1273,9 +1612,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_admin_keyboard())
         return
 
+    # ─── Ввод суммы пополнения ──────────────────────────────────────────────
     if ctx.user_data.get("awaiting_topup"):
         ctx.user_data["awaiting_topup"] = False
-        raw = update.message.text.strip()
+        raw = text
         if not raw.isdigit():
             await update.message.reply_text(
                 "❌ Нужно целое число.",
@@ -1298,8 +1638,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=_sub_keyboard())
         return
 
-    text = update.message.text.strip()
-    logger.info("HANDLER: text=%r", text)
     if not text or text.startswith("/"):
         return
 
