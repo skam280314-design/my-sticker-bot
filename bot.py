@@ -8,10 +8,9 @@ import logging
 import tempfile
 import gzip
 import json
-import sqlite3
 from pathlib import Path
 
-import libsql_experimental as libsql
+import libsql_client
 
 from dotenv import load_dotenv
 from telegram import (
@@ -48,10 +47,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN         = os.getenv("TELEGRAM_TOKEN")
-TURSO_URL     = os.getenv("TURSO_DATABASE_URL")
-TURSO_TOKEN   = os.getenv("TURSO_AUTH_TOKEN")
-BOT_USERNAME  = os.getenv("BOT_USERNAME", "emojieditoryahimkibot")
+TOKEN        = os.getenv("TELEGRAM_TOKEN")
+TURSO_URL    = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN  = os.getenv("TURSO_AUTH_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "emojieditoryahimkibot")
 
 ADMIN_ID = 8572202921
 
@@ -94,19 +93,6 @@ FONTS = [
     ("PressStart2P-Regular","8. PressStart2P"),
 ]
 
-COLORS = [
-    ("⚪ Белый",     "#ffffff"),
-    ("⚫ Чёрный",    "#000000"),
-    ("🔴 Красный",   "#ff3b30"),
-    ("🟠 Оранжевый", "#ff9500"),
-    ("🟡 Жёлтый",    "#ffd60a"),
-    ("🟢 Зелёный",   "#34c759"),
-    ("🔵 Синий",     "#007aff"),
-    ("🟣 Фиолетовый","#af52de"),
-    ("🩷 Розовый",   "#ff2d92"),
-    ("🩵 Голубой",   "#5ac8fa"),
-]
-
 
 def _category_dir(key: str) -> Path:
     return SHARED_DIR / key
@@ -135,23 +121,39 @@ def _category_info(key: str):
     return "📁", key
 
 
-def _font_path(key: str) -> Path | None:
+def _font_path(key: str):
     for fname, _label in FONTS:
         if fname == key:
-            p = FONTS_DIR / f"{fname}.ttf"
-            if p.exists():
-                return p
-            p2 = FONTS_DIR / f"{fname}.otf"
-            if p2.exists():
-                return p2
+            for ext in (".ttf", ".otf"):
+                p = FONTS_DIR / f"{fname}{ext}"
+                if p.exists():
+                    return p
     return None
 
 
-# ─── БД (Turso) ─────────────────────────────────────────────────────────────
+# ─── БД (libsql-client) ─────────────────────────────────────────────────────
+
+_client = None
+
+
+def get_client():
+    global _client
+    if _client is None:
+        _client = libsql_client.create_client_sync(
+            url=TURSO_URL,
+            auth_token=TURSO_TOKEN,
+        )
+    return _client
+
+
+def db_exec(query: str, params: tuple = ()):
+    c = get_client()
+    return c.execute(query, params)
+
 
 def db_init():
-    con = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
-    con.execute("""
+    c = get_client()
+    c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id     INTEGER PRIMARY KEY,
             username    TEXT,
@@ -161,7 +163,7 @@ def db_init():
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    con.execute("""
+    c.execute("""
         CREATE TABLE IF NOT EXISTS sets (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id     INTEGER NOT NULL,
@@ -171,184 +173,130 @@ def db_init():
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    con.execute("""
+    c.execute("""
         CREATE TABLE IF NOT EXISTS stats (
             key   TEXT PRIMARY KEY,
             value INTEGER NOT NULL DEFAULT 0
         )
     """)
-    con.commit()
-    con.close()
 
 
-def db():
-    con = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
-    con.row_factory = sqlite3.Row
-    return con
+def _row_get(row, idx, key=None):
+    """libsql-client возвращает ResultSet. rows — список кортежей или dict."""
+    if isinstance(row, dict):
+        return row.get(key) if key else row
+    if isinstance(row, (list, tuple)):
+        return row[idx]
+    return row
 
 
 def remember_user(user):
     if user is None:
         return
-    con = db()
-    try:
-        con.execute("""
-            INSERT INTO users (user_id, username, first_name, balance)
-            VALUES (?, ?, ?, 0)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name
-        """, (user.id, user.username or "", user.first_name or ""))
-        con.commit()
-    finally:
-        con.close()
+    db_exec("""
+        INSERT INTO users (user_id, username, first_name, balance)
+        VALUES (?, ?, ?, 0)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name
+    """, (user.id, user.username or "", user.first_name or ""))
 
 
 def find_user_by_username(username: str):
     if not username:
         return None
     u = username.lstrip("@").lower()
-    con = db()
-    try:
-        row = con.execute(
-            "SELECT user_id FROM users WHERE LOWER(username) = ? LIMIT 1", (u,)
-        ).fetchone()
-        return row["user_id"] if row else None
-    finally:
-        con.close()
+    rs = db_exec(
+        "SELECT user_id FROM users WHERE LOWER(username) = ? LIMIT 1", (u,))
+    if not rs.rows:
+        return None
+    return _row_get(rs.rows[0], 0, "user_id")
 
 
 def get_balance(user_id: int) -> int:
-    con = db()
-    try:
-        row = con.execute("SELECT balance FROM users WHERE user_id = ?",
-                          (user_id,)).fetchone()
-        return row["balance"] if row else 0
-    finally:
-        con.close()
+    rs = db_exec("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    if not rs.rows:
+        return 0
+    return int(_row_get(rs.rows[0], 0, "balance") or 0)
 
 
 def add_balance(user_id: int, amount: int):
-    con = db()
-    try:
-        con.execute("""
-            INSERT INTO users (user_id, balance) VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
-        """, (user_id, amount, amount))
-        con.commit()
-    finally:
-        con.close()
+    db_exec("""
+        INSERT INTO users (user_id, balance) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?
+    """, (user_id, amount, amount))
 
 
 def spend_balance(user_id: int, amount: int) -> bool:
-    con = db()
-    try:
-        row = con.execute("SELECT balance FROM users WHERE user_id = ?",
-                          (user_id,)).fetchone()
-        bal = row["balance"] if row else 0
-        if bal < amount:
-            return False
-        con.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?",
-                    (amount, user_id))
-        con.commit()
-        return True
-    finally:
-        con.close()
+    bal = get_balance(user_id)
+    if bal < amount:
+        return False
+    db_exec("UPDATE users SET balance = balance - ? WHERE user_id = ?",
+            (amount, user_id))
+    return True
 
 
 def inc_generated(user_id: int):
-    con = db()
-    try:
-        con.execute("UPDATE users SET generated = generated + 1 WHERE user_id = ?",
-                    (user_id,))
-        con.commit()
-    finally:
-        con.close()
+    db_exec("UPDATE users SET generated = generated + 1 WHERE user_id = ?",
+            (user_id,))
 
 
 def stat_inc(key: str, amount: int = 1):
-    con = db()
-    try:
-        con.execute("""
-            INSERT INTO stats (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = value + ?
-        """, (key, amount, amount))
-        con.commit()
-    finally:
-        con.close()
+    db_exec("""
+        INSERT INTO stats (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = value + ?
+    """, (key, amount, amount))
 
 
 def stat_get(key: str) -> int:
-    con = db()
-    try:
-        row = con.execute("SELECT value FROM stats WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else 0
-    finally:
-        con.close()
+    rs = db_exec("SELECT value FROM stats WHERE key = ?", (key,))
+    if not rs.rows:
+        return 0
+    return int(_row_get(rs.rows[0], 0, "value") or 0)
 
 
 def count_users() -> int:
-    con = db()
-    try:
-        return con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-    finally:
-        con.close()
+    rs = db_exec("SELECT COUNT(*) FROM users", ())
+    if not rs.rows:
+        return 0
+    return int(_row_get(rs.rows[0], 0) or 0)
 
 
 def list_users(limit: int = 50):
-    con = db()
-    try:
-        return con.execute(
-            "SELECT * FROM users ORDER BY user_id LIMIT ?", (limit,)
-        ).fetchall()
-    finally:
-        con.close()
+    rs = db_exec("""
+        SELECT user_id, username, first_name, balance
+        FROM users ORDER BY user_id LIMIT ?
+    """, (limit,))
+    return rs.rows
 
 
 def get_all_user_ids():
-    con = db()
-    try:
-        return [r["user_id"] for r in con.execute("SELECT user_id FROM users").fetchall()]
-    finally:
-        con.close()
+    rs = db_exec("SELECT user_id FROM users", ())
+    return [int(_row_get(r, 0, "user_id")) for r in rs.rows]
 
 
 def add_set(user_id: int, path: str, text: str, template_name: str):
-    con = db()
-    try:
-        con.execute(
-            "INSERT INTO sets (user_id, path, text, template) VALUES (?, ?, ?, ?)",
-            (user_id, path, text, template_name))
-        con.commit()
-    finally:
-        con.close()
+    db_exec("""
+        INSERT INTO sets (user_id, path, text, template) VALUES (?, ?, ?, ?)
+    """, (user_id, path, text, template_name))
 
 
 def list_sets(user_id: int):
-    con = db()
-    try:
-        return con.execute(
-            "SELECT * FROM sets WHERE user_id = ? ORDER BY id DESC",
-            (user_id,)
-        ).fetchall()
-    finally:
-        con.close()
+    rs = db_exec("""
+        SELECT path, text FROM sets WHERE user_id = ? ORDER BY id DESC
+    """, (user_id,))
+    return rs.rows
 
 
 def clear_sets(user_id: int):
-    con = db()
-    try:
-        rows = con.execute("SELECT path FROM sets WHERE user_id = ?",
-                           (user_id,)).fetchall()
-        for r in rows:
-            try:
-                Path(r["path"]).unlink(missing_ok=True)
-            except Exception:
-                pass
-        con.execute("DELETE FROM sets WHERE user_id = ?", (user_id,))
-        con.commit()
-    finally:
-        con.close()
+    rs = db_exec("SELECT path FROM sets WHERE user_id = ?", (user_id,))
+    for r in rs.rows:
+        p = _row_get(r, 0, "path")
+        try:
+            Path(p).unlink(missing_ok=True)
+        except Exception:
+            pass
+    db_exec("DELETE FROM sets WHERE user_id = ?", (user_id,))
 
 
 # ─── Утилиты ────────────────────────────────────────────────────────────────
@@ -399,7 +347,6 @@ async def send_topup_invoice(bot, chat_id: int, amount: int):
 
 
 def _sanitize_pack_name(raw: str) -> str:
-    """Приводит ввод к допустимому имени пака (латиница, цифры, _)."""
     s = raw.strip().lower()
     s = re.sub(r"[^a-z0-9_]", "_", s)
     s = re.sub(r"__+", "_", s).strip("_")
@@ -444,10 +391,6 @@ def _main_menu(user_id: int):
 def _admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data="adm_stats")],
-        [InlineKeyboardButton("⭐ Выдать звёзды", callback_data="adm_give_stars")],
-        [InlineKeyboardButton("👥 Пользователи", callback_data="adm_users")],
-        [InlineKeyboardButton("📢 Рассылка", callback_data="adm_broadcast")],
-        [InlineKeyboardButton("📁 Файлы shared", callback_data="adm_files")],
         [InlineKeyboardButton("🏠 В меню", callback_data="main")],
     ])
 
@@ -467,7 +410,6 @@ def _gallery_keyboard(cat: str, page: int, total_pages: int,
     if row:
         rows.append(row)
 
-    # Навигация
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"cat:{cat}:{page-1}"))
@@ -491,8 +433,8 @@ def _gallery_keyboard(cat: str, page: int, total_pages: int,
         InlineKeyboardButton("❌ Снять всё",   callback_data=f"desel:{cat}:{page}"),
     ])
     rows.append([
-        InlineKeyboardButton("💳 Оплатить", callback_data="pay_start"),
-        InlineKeyboardButton("🏠 В меню",   callback_data="main"),
+        InlineKeyboardButton("➡️ Далее", callback_data="gen_start"),
+        InlineKeyboardButton("🏠 В меню", callback_data="main"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -512,42 +454,14 @@ def _font_keyboard():
         rows.append(row)
     rows.append([InlineKeyboardButton("⬆️ Загрузить .ttf/.otf",
                                       callback_data="font_upload")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="main")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _color_keyboard(target: str):
-    rows = []
-    row = []
-    for i, (label, hex_color) in enumerate(COLORS):
-        row.append(InlineKeyboardButton(
-            label,
-            callback_data=f"color:{target}:{hex_color.lstrip('#')}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
     rows.append([InlineKeyboardButton("🏠 В меню", callback_data="main")])
     return InlineKeyboardMarkup(rows)
 
 
-def _recolor_panel_keyboard(colors: dict):
-    bg = colors.get("bg", "не выбран")
-    shape = colors.get("shape", "не выбран")
-    outline = colors.get("outline", "не выбран")
-    text = colors.get("text", "не выбран")
-
-    def label(name, val):
-        return f"{name}: {val if val != 'не выбран' else 'не выбран'}"
-
+def _pack_action_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label("🖼️ Фон", bg),       callback_data="pick_color:bg"),
-         InlineKeyboardButton(label("🧍 Персонаж", shape), callback_data="pick_color:shape")],
-        [InlineKeyboardButton(label("🖌 Контур", outline), callback_data="pick_color:outline"),
-         InlineKeyboardButton(label("✏️ Текст", text),     callback_data="pick_color:text")],
-        [InlineKeyboardButton("✅ Готово",               callback_data="recolor_done")],
-        [InlineKeyboardButton("❌ Отмена",                callback_data="main")],
+        [InlineKeyboardButton("📦 Создать пак", callback_data="create_pack")],
+        [InlineKeyboardButton("🏠 В меню", callback_data="main")],
     ])
 
 
@@ -559,7 +473,6 @@ def _back_menu():
 # ─── /start ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.info("HANDLER: /start")
     user = update.effective_user
     remember_user(user)
     user_id = user.id
@@ -574,9 +487,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "✨ <b>Edit Emoji Bot</b> ✨\n\n"
         f"Привет, {user.first_name}!\n\n"
-        "🎨 Выбери категорию, шаблоны (галочками) и текст.\n"
-        f"📦 Максимум за раз: {MAX_SELECT} стикеров\n"
-        f"💰 Цена: {PRICE_STARS} ⭐ за стикер\n"
+        "🎨 Выбери категорию, отметь шаблоны (✅), затем напиши текст.\n"
+        f"📦 Максимум за раз: {MAX_SELECT}\n"
+        f"💰 {PRICE_STARS} ⭐ за стикер\n"
         f"⭐ <b>Баланс:</b> {bal}"
     )
     await update.message.reply_text(text, reply_markup=_main_menu(user_id),
@@ -587,8 +500,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    logger.info("CALLBACK: %r", q.data)
-
     data = q.data or ""
     user = q.from_user
     remember_user(user)
@@ -598,7 +509,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await check_subscription(ctx.bot, user_id):
             await q.answer("✅ Подписка подтверждена!")
             await q.message.reply_text(
-                f"✅ Спасибо!\n⭐ Баланс: {get_balance(user_id)}",
+                f"✅ Баланс: {get_balance(user_id)}",
                 reply_markup=_main_menu(user_id))
         else:
             await q.answer("❌ Вы ещё не подписаны", show_alert=True)
@@ -608,22 +519,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("❌ Сначала подпишитесь на канал", show_alert=True)
         return
 
-    # Выбор шрифта
+    # ─── Шрифт ──────────────────────────────────────────────────────────────
     if data.startswith("font:"):
         await q.answer()
         fkey = data.split(":", 1)[1]
         p = _font_path(fkey)
         if not p:
             await q.message.reply_text(
-                f"❌ Шрифт <code>{fkey}</code> не найден.\n"
-                f"Скачай его в папку <code>fonts/</code>.",
+                f"❌ Шрифт <code>{fkey}</code> не найден в папке fonts/.",
                 parse_mode="HTML")
             return
-        ctx.user_data["font_path"] = str(p)
+        ctx.user_data["font_path"]  = str(p)
         ctx.user_data["font_label"] = fkey
         await q.message.reply_text(
             f"✅ Шрифт <b>{fkey}</b> выбран.\n\n"
-            f"Теперь напиши текст (до 12 символов) — сгенерирую все выбранные.",
+            f"Напиши текст (до 12 символов).",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 В меню", callback_data="main")]]))
@@ -633,67 +543,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         ctx.user_data["awaiting_font"] = True
         await q.message.reply_text(
-            "⬆️ Отправь .ttf или .otf файл — сохраню как шрифт.",
+            "⬆️ Отправь .ttf или .otf файл.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Отмена", callback_data="main")]]))
         return
 
-    if data == "pay_start":
+    # ─── "Далее" → выбор шрифта ─────────────────────────────────────────────
+    if data == "gen_start":
         await q.answer()
         selected = ctx.user_data.get("selected_templates", [])
         if not selected:
-            await q.message.reply_text("❌ Сначала выбери хотя бы один шаблон.")
+            await q.message.reply_text("❌ Выбери хотя бы один шаблон.")
             return
-        price = PRICE_STARS * len(selected)
-        # Списываем сразу (можно перенести после оплаты)
         await q.message.reply_text(
-            f"💳 Оплата: <b>{price} ⭐</b> за {len(selected)} стикер(ов).\n\n"
-            f"Напиши текст (до 12 символов) — сгенерирую.",
+            f"🎨 Выбрано: <b>{len(selected)}</b>.\n"
+            f"Теперь выбери шрифт:",
             parse_mode="HTML",
             reply_markup=_font_keyboard())
         return
 
-    # Админка — упрощённая
-    if data.startswith("adm") or data == "admin":
-        if not is_admin(user_id):
-            await q.answer("❌ Нет доступа", show_alert=True)
-            return
-        await q.answer()
-
-        if data == "admin":
-            await q.message.reply_text("🛠 <b>Админ-панель</b>",
-                                       parse_mode="HTML",
-                                       reply_markup=_admin_keyboard())
-            return
-
-        if data == "adm_stats":
-            lines = ["📊 <b>Статистика</b>\n"]
-            lines.append(f"👥 Пользователей: <b>{count_users()}</b>")
-            lines.append(f"🎨 Сгенерировано: <b>{stat_get('generated')}</b>")
-            lines.append(f"⭐ Звёзд: <b>{stat_get('stars')}</b>\n")
-            for key, emoji, name in CATEGORIES:
-                cnt = len(_category_templates(key))
-                lines.append(f"  {emoji} {name}: {cnt}")
-            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
-                                       reply_markup=_admin_keyboard())
-            return
-
-        if data == "adm_files":
-            lines = ["📁 <b>Файлы shared/</b>\n"]
-            for key, emoji, name in CATEGORIES:
-                d = _category_dir(key)
-                cnt = len(list(d.glob("*.tgs"))) if d.exists() else 0
-                lines.append(f"{emoji} <b>{name}</b>: {cnt}")
-            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
-                                       reply_markup=_admin_keyboard())
-            return
-
-        if data in ("adm_give_stars", "adm_users", "adm_broadcast"):
-            await q.message.reply_text("🚧 Функция в разработке.",
-                                       reply_markup=_admin_keyboard())
-            return
-
-    # Мультивыбор шаблонов
+    # ─── Мультивыбор ────────────────────────────────────────────────────────
     if data.startswith("toggle:"):
         await q.answer()
         try:
@@ -707,11 +576,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             selected.discard(idx_global)
         else:
             if len(selected) >= MAX_SELECT:
-                await q.answer(f"Максимум {MAX_SELECT} шаблонов", show_alert=True)
+                await q.answer(f"Максимум {MAX_SELECT}", show_alert=True)
                 return
             selected.add(idx_global)
         ctx.user_data["selected_templates"] = list(selected)
-        # Перерисовываем клавиатуру
+
         templates = _category_templates(cat)
         total_pages = min(MAX_PAGES, (len(templates) + PER_PAGE - 1) // PER_PAGE)
         kb = _gallery_keyboard(cat, page, total_pages, selected, PER_PAGE)
@@ -722,7 +591,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("sel_all:"):
-        await q.answer("Выбрано всё на странице")
+        await q.answer()
         _, cat, page_s = data.split(":")
         page = int(page_s)
         templates = _category_templates(cat)
@@ -743,7 +612,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("desel:"):
-        await q.answer("Снято")
+        await q.answer()
         _, cat, page_s = data.split(":")
         page = int(page_s)
         templates = _category_templates(cat)
@@ -761,7 +630,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # Показ галереи
+    # ─── Показ галереи ──────────────────────────────────────────────────────
     if data.startswith("cat:"):
         try:
             _, cat, page_s = data.split(":")
@@ -814,10 +683,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.exception("Фото не ушло")
         return
 
+    # ─── Топ-ап ─────────────────────────────────────────────────────────────
     if data == "topup":
         await q.answer()
         await q.message.reply_text(
-            "⭐ <b>Пополнение баланса</b>\n\nВыбери сумму:",
+            "⭐ <b>Пополнение</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⭐ 10",  callback_data="buy:10"),
@@ -834,14 +704,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             amount = int(data.split(":", 1)[1])
         except (IndexError, ValueError):
             return
-        if amount < 1 or amount > MAX_TOPUP:
-            return
         try:
             await send_topup_invoice(ctx.bot, user_id, amount)
         except Exception as e:
             await q.message.reply_text(f"❌ Ошибка: {e}")
         return
 
+    # ─── Создание пака ──────────────────────────────────────────────────────
+    if data == "create_pack":
+        await q.answer()
+        ctx.user_data["awaiting_pack_name"] = True
+        await q.message.reply_text(
+            "📦 <b>Создание пака</b>\n\n"
+            "Отправь название пака (латиница, цифры, <code>_</code>).\n"
+            "Например: <code>my_cool_pack</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Отмена", callback_data="main")]]))
+        return
+
+    # ─── Меню ───────────────────────────────────────────────────────────────
     if data == "main":
         await q.answer()
         await q.message.reply_text(
@@ -852,8 +734,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "help":
         await q.answer()
         await q.message.reply_text(
-            "ℹ️ Выбери категорию, отметь шаблоны (✅), затем напиши текст.\n\n"
-            "После текста выбери шрифт — бот сгенерирует все выбранные стикеры.",
+            "ℹ️ 1. Выбери категорию.\n"
+            "2. Отметь шаблоны (✅).\n"
+            "3. Нажми «Далее».\n"
+            "4. Напиши текст.\n"
+            "5. Выбери шрифт.\n"
+            "6. Получи стикеры или создай пак.",
             reply_markup=_back_menu())
         return
 
@@ -878,6 +764,32 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("🗑 Удалено.", reply_markup=_back_menu())
         return
 
+    # ─── Админка ────────────────────────────────────────────────────────────
+    if data == "admin":
+        if not is_admin(user_id):
+            await q.answer("❌ Нет доступа", show_alert=True)
+            return
+        await q.answer()
+        await q.message.reply_text("🛠 <b>Админка</b>",
+                                   parse_mode="HTML",
+                                   reply_markup=_admin_keyboard())
+        return
+
+    if data == "adm_stats":
+        if not is_admin(user_id):
+            await q.answer("❌", show_alert=True)
+            return
+        await q.answer()
+        lines = [
+            "📊 <b>Статистика</b>\n",
+            f"👥 Пользователей: {count_users()}",
+            f"🎨 Сгенерировано: {stat_get('generated')}",
+            f"⭐ Звёзд: {stat_get('stars')}",
+        ]
+        await q.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                   reply_markup=_admin_keyboard())
+        return
+
     if data == "noop":
         await q.answer()
         return
@@ -892,11 +804,6 @@ async def precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     payload = q.invoice_payload or ""
     if not payload.startswith("topup_"):
         await q.answer(ok=False, error_message="Неизвестный платёж")
-        return
-    try:
-        amount = int(payload.split("_", 1)[1])
-    except (IndexError, ValueError):
-        await q.answer(ok=False, error_message="Некорректная сумма")
         return
     await q.answer(ok=True)
 
@@ -921,20 +828,20 @@ async def successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Оплата получена.")
 
 
-# ─── Стикер-шаблон ──────────────────────────────────────────────────────────
+# ─── Стикер-шаблон от пользователя ──────────────────────────────────────────
 
 async def on_sticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     remember_user(user)
 
     if not await check_subscription(ctx.bot, user.id):
-        await update.message.reply_text(f"📢 Сначала подпишитесь на {CHANNEL}.",
+        await update.message.reply_text(f"📢 Подпишитесь на {CHANNEL}.",
                                         reply_markup=_sub_keyboard())
         return
 
     sticker = update.message.sticker
     if not sticker.is_animated:
-        await update.message.reply_text("Нужен анимированный (.tgs).",
+        await update.message.reply_text("Нужен .tgs.",
                                         reply_markup=_main_menu(user.id))
         return
 
@@ -954,21 +861,58 @@ async def on_sticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             kind = f"векторный ({extra['n_sh']} контуров)"
         else:
             kind = f"глифовый ({len(_collect_all_groups(extra['main_shape']))} букв)"
-
         ctx.user_data["personal_template"] = str(template)
         await msg.edit_text(
-            f"✅ Личный шаблон сохранён! Тип: {kind}\nНапиши текст.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 В меню", callback_data="main")]]))
-    except ValueError:
-        template.unlink(missing_ok=True)
-        await msg.edit_text("❌ Не нашёл текстовый слой.",
-                            reply_markup=_main_menu(user.id))
+            f"✅ Шаблон сохранён. Тип: {kind}\nНапиши текст.",
+            reply_markup=_main_menu(user.id))
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=_main_menu(user.id))
+        template.unlink(missing_ok=True)
+        await msg.edit_text(f"❌ Ошибка: {e}",
+                            reply_markup=_main_menu(user.id))
 
 
-# ─── Обработка текста / генерация ───────────────────────────────────────────
+# ─── Документ (шрифт) ───────────────────────────────────────────────────────
+
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc:
+        return
+    if not doc.file_name.lower().endswith((".ttf", ".otf")):
+        return
+    user = update.effective_user
+    msg = await update.message.reply_text("⬆️ Скачиваю шрифт...")
+    try:
+        file = await ctx.bot.get_file(doc.file_id)
+        target = FONTS_DIR / doc.file_name
+        await file.download_to_drive(str(target))
+        ctx.user_data["font_path"]  = str(target)
+        ctx.user_data["font_label"] = doc.file_name
+        await msg.edit_text(
+            f"✅ Шрифт сохранён и выбран: <code>{doc.file_name}</code>",
+            parse_mode="HTML",
+            reply_markup=_main_menu(user.id))
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+# ─── Генерация ──────────────────────────────────────────────────────────────
+
+async def generate_selected(user_id: int, cat: str,
+                             selected: list, text: str,
+                             font_path: str, bot, message) -> list:
+    """Возвращает список путей к сгенерированным .tgs."""
+    templates = _category_templates(cat)
+    out_files = []
+    for idx_global in selected:
+        if idx_global >= len(templates):
+            continue
+        name, path = templates[idx_global]
+        with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
+            out_path = tmp.name
+        generate_sticker(text, str(path), out_path, font_path=font_path)
+        out_files.append(out_path)
+    return out_files
+
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -976,11 +920,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     text = update.message.text.strip()
 
-    # Загрузка шрифта
     if ctx.user_data.get("awaiting_font"):
         ctx.user_data["awaiting_font"] = False
         await update.message.reply_text(
-            "❌ Нужно отправить .ttf или .otf файл, а не текст.",
+            "❌ Нужно отправить .ttf или .otf.",
             reply_markup=_main_menu(user_id))
         return
 
@@ -992,11 +935,59 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/"):
         return
 
-    if len(text) > 12:
-        await update.message.reply_text(f"Слишком длинный текст ({len(text)}). Макс — 12.")
+    # ─── Создание пака ──────────────────────────────────────────────────────
+    if ctx.user_data.get("awaiting_pack_name"):
+        ctx.user_data["awaiting_pack_name"] = False
+        generated = ctx.user_data.get("generated_files", [])
+        if not generated:
+            await update.message.reply_text(
+                "❌ Нет сгенерированных стикеров.",
+                reply_markup=_main_menu(user_id))
+            return
+        pack_name = _sanitize_pack_name(text)
+        msg = await update.message.reply_text(
+            f"📦 Создаю пак <code>{pack_name}</code>...",
+            parse_mode="HTML")
+        try:
+            stickers = []
+            for f in generated:
+                with open(f, "rb") as fh:
+                    uploaded = await ctx.bot.upload_sticker_file(
+                        user_id=user_id, sticker=fh, sticker_format="animated")
+                stickers.append(InputSticker(
+                    sticker=uploaded.file_id,
+                    format="animated",
+                    emoji_list=["😀"],
+                ))
+            title = text[:64]
+            await ctx.bot.create_new_sticker_set(
+                user_id=user_id,
+                name=pack_name,
+                title=title,
+                stickers=stickers,
+                sticker_type="regular",
+            )
+            link = f"https://t.me/addemoji/{pack_name}"
+            await msg.edit_text(
+                f"✅ <b>Пак создан!</b>\n\n"
+                f"🔗 <a href='{link}'>{link}</a>",
+                parse_mode="HTML",
+                reply_markup=_main_menu(user_id))
+        except BadRequest as e:
+            await msg.edit_text(
+                f"❌ Ошибка Telegram: {e.message}\n\n"
+                f"Возможно, имя <code>{pack_name}</code> уже занято — попробуй другое.",
+                parse_mode="HTML")
+        except Exception as e:
+            logger.exception("Ошибка пака")
+            await msg.edit_text(f"❌ Ошибка: {e}")
         return
 
-    # Проверяем — есть ли выбранные шаблоны
+    # ─── Генерация стикеров ─────────────────────────────────────────────────
+    if len(text) > 12:
+        await update.message.reply_text(f"Слишком длинный текст ({len(text)}).")
+        return
+
     selected = ctx.user_data.get("selected_templates", [])
     cat = None
     for k, _, _ in CATEGORIES:
@@ -1008,7 +999,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_main_menu(user_id))
         return
 
-    # Проверяем шрифт
     font_path = ctx.user_data.get("font_path")
     if not font_path:
         await update.message.reply_text(
@@ -1016,7 +1006,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_font_keyboard())
         return
 
-    # Списываем баланс
     is_adm = is_admin(user_id)
     total_price = PRICE_STARS * len(selected)
     if not is_adm:
@@ -1026,27 +1015,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_main_menu(user_id))
             return
 
-    templates = _category_templates(cat)
-    # Генерируем стикеры
     msg = await update.message.reply_text(
         f"⚙️ Генерирую {len(selected)} стикер(ов)...")
-    out_files = []
     try:
-        for idx_global in selected:
-            if idx_global >= len(templates):
-                continue
-            name, path = templates[idx_global]
-            with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
-                out_path = tmp.name
-            generate_sticker(text, str(path), out_path, font_path=font_path)
-            out_files.append(out_path)
+        out_files = await generate_selected(
+            user_id, cat, selected, text, font_path, ctx.bot, update.message)
 
-        # Отправляем по одному
         for f_path in out_files:
             with open(f_path, "rb") as f:
                 await update.message.reply_sticker(sticker=f)
             add_set(user_id, f_path, text, "multi")
 
+        ctx.user_data["generated_files"] = out_files
         await msg.delete()
         inc_generated(user_id)
         stat_inc("generated")
@@ -1054,50 +1034,21 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Готово! Списано {total_price} ⭐\n"
             f"⭐ Баланс: {get_balance(user_id)}\n\n"
-            f"📦 Сохранено в «Ваши стикеры».",
-            parse_mode="HTML",
-            reply_markup=_main_menu(user_id))
+            f"Хочешь собрать всё в пак?",
+            reply_markup=_pack_action_keyboard())
 
         ctx.user_data["selected_templates"] = []
-        ctx.user_data.pop("pending_text", None)
     except Exception as e:
         logger.exception("Ошибка генерации")
         await msg.edit_text(f"❌ Ошибка: {e}")
-    finally:
-        # Чистим временные (но сохранённые — оставляем)
-        pass
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    for k in ("awaiting_font", "pending_text"):
+    for k in ("awaiting_font", "awaiting_pack_name", "pending_text"):
         ctx.user_data.pop(k, None)
     ctx.user_data["selected_templates"] = []
     await update.message.reply_text("Отменено.",
                                     reply_markup=_main_menu(update.effective_user.id))
-
-
-async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Приём шрифта от пользователя."""
-    user = update.effective_user
-    doc = update.message.document
-    if not doc:
-        return
-    if not doc.file_name.lower().endswith((".ttf", ".otf")):
-        return
-    msg = await update.message.reply_text("⬆️ Скачиваю шрифт...")
-    try:
-        file = await ctx.bot.get_file(doc.file_id)
-        target = FONTS_DIR / doc.file_name
-        await file.download_to_drive(str(target))
-        ctx.user_data["font_path"] = str(target)
-        ctx.user_data["font_label"] = doc.file_name
-        await msg.edit_text(
-            f"✅ Шрифт <code>{doc.file_name}</code> сохранён и выбран.",
-            parse_mode="HTML",
-            reply_markup=_main_menu(user.id))
-    except Exception as e:
-        logger.exception("Ошибка загрузки шрифта")
-        await msg.edit_text(f"❌ Ошибка: {e}")
 
 
 # ─── Запуск ─────────────────────────────────────────────────────────────────
@@ -1108,7 +1059,7 @@ async def on_error(update, ctx):
 
 def main():
     if not TOKEN:
-        raise ValueError("Укажи TELEGRAM_TOKEN в .env")
+        raise ValueError("Укажи TELEGRAM_TOKEN")
     if not TURSO_URL or not TURSO_TOKEN:
         raise ValueError("Укажи TURSO_DATABASE_URL и TURSO_AUTH_TOKEN")
 
