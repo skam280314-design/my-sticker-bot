@@ -71,8 +71,6 @@ PRICE_STARS = 2
 MAX_TOPUP   = 100000
 MAX_SELECT  = 12
 
-RECOLOR_KEY = "recolor"
-
 CATEGORIES = [
     ("main1",    "🎨", "Основной 1"),
     ("main2",    "🎨", "Основной 2"),
@@ -151,6 +149,25 @@ def db_exec(query: str, params: tuple = ()):
     return c.execute(query, params)
 
 
+def _val(row, idx, key=None):
+    """Универсальное получение значения из Row (libsql-client)."""
+    try:
+        if key is not None:
+            v = row[key]
+            if not isinstance(v, (str, int, float, bytes, type(None))):
+                raise TypeError
+            return v
+    except (KeyError, TypeError, IndexError):
+        pass
+    try:
+        lst = list(row)
+        if 0 <= idx < len(lst):
+            return lst[idx]
+    except (TypeError, IndexError):
+        pass
+    return None
+
+
 def db_init():
     c = get_client()
     c.execute("""
@@ -181,27 +198,6 @@ def db_init():
     """)
 
 
-def _row_get(row, idx, key=None):
-    """libsql-client возвращает Row — у него есть доступ по индексу и по имени."""
-    # Row поддерживает и индекс, и имя
-    if key is not None:
-        try:
-            return row[key]
-        except (KeyError, TypeError, IndexError):
-            pass
-    try:
-        return row[idx]
-    except (KeyError, TypeError, IndexError):
-        pass
-    # Если совсем непонятно — пробуем как атрибут
-    if key:
-        try:
-            return getattr(row, key)
-        except AttributeError:
-            pass
-    return None
-
-
 def remember_user(user):
     if user is None:
         return
@@ -222,24 +218,16 @@ def find_user_by_username(username: str):
         "SELECT user_id FROM users WHERE LOWER(username) = ? LIMIT 1", (u,))
     if not rs.rows:
         return None
-    return _row_get(rs.rows[0], 0, "user_id")
+    return _val(rs.rows[0], 0, "user_id")
 
 
 def get_balance(user_id: int) -> int:
     rs = db_exec("SELECT balance FROM users WHERE user_id = ?", (user_id,))
     if not rs.rows:
         return 0
-    row = rs.rows[0]
-    # libsql-client Row поддерживает и [idx], и [name]
+    v = _val(rs.rows[0], 0, "balance")
     try:
-        val = row["balance"]
-    except (KeyError, TypeError, IndexError):
-        try:
-            val = row[0]
-        except (KeyError, TypeError, IndexError):
-            val = 0
-    try:
-        return int(val)
+        return int(v) if v is not None else 0
     except (TypeError, ValueError):
         return 0
 
@@ -276,14 +264,22 @@ def stat_get(key: str) -> int:
     rs = db_exec("SELECT value FROM stats WHERE key = ?", (key,))
     if not rs.rows:
         return 0
-    return int(_row_get(rs.rows[0], 0, "value") or 0)
+    v = _val(rs.rows[0], 0, "value")
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def count_users() -> int:
     rs = db_exec("SELECT COUNT(*) FROM users", ())
     if not rs.rows:
         return 0
-    return int(_row_get(rs.rows[0], 0) or 0)
+    v = _val(rs.rows[0], 0)
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def list_users(limit: int = 50):
@@ -296,7 +292,12 @@ def list_users(limit: int = 50):
 
 def get_all_user_ids():
     rs = db_exec("SELECT user_id FROM users", ())
-    return [int(_row_get(r, 0, "user_id")) for r in rs.rows]
+    result = []
+    for r in rs.rows:
+        v = _val(r, 0, "user_id")
+        if v is not None:
+            result.append(int(v))
+    return result
 
 
 def add_set(user_id: int, path: str, text: str, template_name: str):
@@ -315,11 +316,12 @@ def list_sets(user_id: int):
 def clear_sets(user_id: int):
     rs = db_exec("SELECT path FROM sets WHERE user_id = ?", (user_id,))
     for r in rs.rows:
-        p = _row_get(r, 0, "path")
-        try:
-            Path(p).unlink(missing_ok=True)
-        except Exception:
-            pass
+        p = _val(r, 0, "path")
+        if p:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
     db_exec("DELETE FROM sets WHERE user_id = ?", (user_id,))
 
 
@@ -511,7 +513,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "✨ <b>Edit Emoji Bot</b> ✨\n\n"
         f"Привет, {user.first_name}!\n\n"
-        "🎨 Выбери категорию, отметь шаблоны (✅), затем напиши текст.\n"
+        "🎨 Выбери категорию, отметь шаблоны (✅), затем «Далее».\n"
         f"📦 Максимум за раз: {MAX_SELECT}\n"
         f"💰 {PRICE_STARS} ⭐ за стикер\n"
         f"⭐ <b>Баланс:</b> {bal}"
@@ -594,6 +596,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             page = int(page_s); idx = int(idx_s)
         except (ValueError, IndexError):
             return
+        ctx.user_data["selected_cat"] = cat
         idx_global = page * PER_PAGE + idx
         selected = set(ctx.user_data.get("selected_templates", []))
         if idx_global in selected:
@@ -618,6 +621,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         _, cat, page_s = data.split(":")
         page = int(page_s)
+        ctx.user_data["selected_cat"] = cat
         templates = _category_templates(cat)
         selected = set(ctx.user_data.get("selected_templates", []))
         start = page * PER_PAGE
@@ -639,6 +643,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         _, cat, page_s = data.split(":")
         page = int(page_s)
+        ctx.user_data["selected_cat"] = cat
         templates = _category_templates(cat)
         selected = set(ctx.user_data.get("selected_templates", []))
         start = page * PER_PAGE
@@ -662,6 +667,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except (ValueError, IndexError):
             await q.answer("Ошибка", show_alert=True)
             return
+
+        # ✅ СОХРАНЯЕМ КАТЕГОРИЮ
+        ctx.user_data["selected_cat"] = cat
 
         templates = _category_templates(cat)
         if not templates:
@@ -740,7 +748,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["awaiting_pack_name"] = True
         await q.message.reply_text(
             "📦 <b>Создание пака</b>\n\n"
-            "Отправь название пака (латиница, цифры, <code>_</code>).\n"
+            "Отправь название (латиница, цифры, <code>_</code>).\n"
             "Например: <code>my_cool_pack</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
@@ -761,8 +769,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "ℹ️ 1. Выбери категорию.\n"
             "2. Отметь шаблоны (✅).\n"
             "3. Нажми «Далее».\n"
-            "4. Напиши текст.\n"
-            "5. Выбери шрифт.\n"
+            "4. Выбери шрифт.\n"
+            "5. Напиши текст.\n"
             "6. Получи стикеры или создай пак.",
             reply_markup=_back_menu())
         return
@@ -921,23 +929,6 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Генерация ──────────────────────────────────────────────────────────────
 
-async def generate_selected(user_id: int, cat: str,
-                             selected: list, text: str,
-                             font_path: str, bot, message) -> list:
-    """Возвращает список путей к сгенерированным .tgs."""
-    templates = _category_templates(cat)
-    out_files = []
-    for idx_global in selected:
-        if idx_global >= len(templates):
-            continue
-        name, path = templates[idx_global]
-        with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
-            out_path = tmp.name
-        generate_sticker(text, str(path), out_path, font_path=font_path)
-        out_files.append(out_path)
-    return out_files
-
-
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     remember_user(user)
@@ -1000,7 +991,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except BadRequest as e:
             await msg.edit_text(
                 f"❌ Ошибка Telegram: {e.message}\n\n"
-                f"Возможно, имя <code>{pack_name}</code> уже занято — попробуй другое.",
+                f"Возможно, имя <code>{pack_name}</code> занято — попробуй другое.",
                 parse_mode="HTML")
         except Exception as e:
             logger.exception("Ошибка пака")
@@ -1013,10 +1004,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     selected = ctx.user_data.get("selected_templates", [])
-    cat = None
-    for k, _, _ in CATEGORIES:
-        if ctx.user_data.get("selected_cat") == k:
-            cat = k
+    cat = ctx.user_data.get("selected_cat")
+
     if not selected or not cat:
         await update.message.reply_text(
             "Сначала выбери категорию и отметь шаблоны (✅).",
@@ -1042,8 +1031,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         f"⚙️ Генерирую {len(selected)} стикер(ов)...")
     try:
-        out_files = await generate_selected(
-            user_id, cat, selected, text, font_path, ctx.bot, update.message)
+        templates = _category_templates(cat)
+        out_files = []
+        for idx_global in selected:
+            if idx_global >= len(templates):
+                continue
+            name, path = templates[idx_global]
+            with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
+                out_path = tmp.name
+            generate_sticker(text, str(path), out_path, font_path=font_path)
+            out_files.append(out_path)
 
         for f_path in out_files:
             with open(f_path, "rb") as f:
@@ -1071,6 +1068,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for k in ("awaiting_font", "awaiting_pack_name", "pending_text"):
         ctx.user_data.pop(k, None)
     ctx.user_data["selected_templates"] = []
+    ctx.user_data.pop("selected_cat", None)
     await update.message.reply_text("Отменено.",
                                     reply_markup=_main_menu(update.effective_user.id))
 
