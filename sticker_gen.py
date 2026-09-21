@@ -8,6 +8,7 @@ from fontTools.pens.qu2cuPen import Qu2CuPen
 from fontTools.pens.transformPen import TransformPen
 
 FONT_PATH = os.path.join(os.path.dirname(__file__), "FreeSansBold.ttf")
+FONTS_DIR = os.path.join(os.path.dirname(__file__), "fonts")
 
 LAYER_TYPE_GLYPH = "glyph"
 LAYER_TYPE_PIXEL = "pixel"
@@ -16,17 +17,19 @@ LAYER_TYPE_BLOB  = "blob"
 MIN_TEXT_SCORE = 6
 MIN_GLYPH_BLOB_SCORE = 3
 
-_font = None
-_glyph_set = None
-_cmap = None
+_font_cache = {}
+_glyph_set_cache = {}
+_cmap_cache = {}
 
 
-def _load_font():
-    global _font, _glyph_set, _cmap
-    if _font is None:
-        _font = TTFont(FONT_PATH)
-        _glyph_set = _font.getGlyphSet()
-        _cmap = _font.getBestCmap()
+def _load_font(font_path: str = None):
+    global _font_cache, _glyph_set_cache, _cmap_cache
+    path = font_path or FONT_PATH
+    if path not in _font_cache:
+        _font_cache[path] = TTFont(path)
+        _glyph_set_cache[path] = _font_cache[path].getGlyphSet()
+        _cmap_cache[path] = _font_cache[path].getBestCmap()
+    return _font_cache[path], _glyph_set_cache[path], _cmap_cache[path]
 
 
 # ─── Lottie helpers ──────────────────────────────────────────────────────────
@@ -60,13 +63,13 @@ def _extract_static_verts(sh_prop):
 
 # ─── Шрифт ───────────────────────────────────────────────────────────────────
 
-def _draw_glyph_decomposed(glyph_name, pen):
+def _draw_glyph_decomposed(glyph_set, glyph_name, pen):
     rec = RecordingPen()
     q2c = Qu2CuPen(rec, max_err=1.0, all_cubic=True)
-    _glyph_set[glyph_name].draw(q2c)
+    glyph_set[glyph_name].draw(q2c)
     for op, args in rec.value:
         if op == "addComponent":
-            _draw_glyph_decomposed(args[0], TransformPen(pen, args[1]))
+            _draw_glyph_decomposed(glyph_set, args[0], TransformPen(pen, args[1]))
         else:
             getattr(pen, op)(*args)
 
@@ -109,17 +112,17 @@ def _ops_to_lottie_contours(ops):
     return contours
 
 
-def get_char_data(char):
-    _load_font()
+def get_char_data(char, font_path=None):
+    _f, glyph_set, cmap = _load_font(font_path)
     if char == " ":
-        gname = _cmap.get(ord(" "), _cmap.get(ord("a")))
-        return [], _glyph_set[gname].width
-    gname = _cmap.get(ord(char))
+        gname = cmap.get(ord(" "), cmap.get(ord("a")))
+        return [], glyph_set[gname].width
+    gname = cmap.get(ord(char))
     if gname is None:
-        gname = _cmap.get(ord("?"), list(_cmap.values())[0])
+        gname = cmap.get(ord("?"), list(cmap.values())[0])
     rec = RecordingPen()
-    _draw_glyph_decomposed(gname, rec)
-    return _ops_to_lottie_contours(rec.value), _glyph_set[gname].width
+    _draw_glyph_decomposed(glyph_set, gname, rec)
+    return _ops_to_lottie_contours(rec.value), glyph_set[gname].width
 
 
 def _build_letter_group(contours, pos_x, pos_y, scale, color=None):
@@ -408,8 +411,9 @@ def _hex_to_rgba(hex_color: str):
 
 def _replace_glyph_text(text, layer, extra,
                         color_rgba=None, size_factor=1.0,
-                        offset_x=0.0, offset_y=0.0):
-    _load_font()
+                        offset_x=0.0, offset_y=0.0,
+                        font_path=None):
+    _load_font(font_path)
     main_shape = extra["main_shape"]
     orig_items = main_shape.get("it", [])
     all_groups = _collect_all_groups(main_shape)
@@ -483,7 +487,7 @@ def _replace_glyph_text(text, layer, extra,
     orig_outer_tr = next((it for it in orig_items if it.get("ty") == "tr"),
                          {"ty": "tr", "o": {"a": 0, "k": 100, "ix": 2}})
 
-    char_data = [(ch, *get_char_data(ch)) for ch in text]
+    char_data = [(ch, *get_char_data(ch, font_path)) for ch in text]
     if x_mirror:
         char_data = list(reversed(char_data))
 
@@ -516,8 +520,9 @@ def _replace_glyph_text(text, layer, extra,
 
 def _replace_blob_text(text, layer, blob_info,
                        color_rgba=None, size_factor=1.0,
-                       offset_x=0.0, offset_y=0.0):
-    _load_font()
+                       offset_x=0.0, offset_y=0.0,
+                       font_path=None):
+    _load_font(font_path)
     bbox    = blob_info["bbox"]
     orig_cx = (bbox["min_x"] + bbox["max_x"]) / 2 + offset_x
     orig_cy = (bbox["min_y"] + bbox["max_y"]) / 2 + offset_y
@@ -527,7 +532,7 @@ def _replace_blob_text(text, layer, blob_info,
     char_data = []
     cursor = 0.0
     for ch in text:
-        contours, advance = get_char_data(ch)
+        contours, advance = get_char_data(ch, font_path)
         char_data.append((ch, contours, advance, cursor))
         cursor += advance
 
@@ -574,12 +579,12 @@ def _replace_blob_text(text, layer, blob_info,
 
 # ─── PIXEL ───────────────────────────────────────────────────────────────────
 
-def _render_text_pixels(text, n_rows):
+def _render_text_pixels(text, n_rows, font_path=None):
     from PIL import Image, ImageDraw, ImageFont
     SCALE = 8
     px_h  = max(8, (n_rows - 1) * SCALE)
     try:
-        font = ImageFont.truetype(FONT_PATH, px_h)
+        font = ImageFont.truetype(font_path or FONT_PATH, px_h)
     except Exception:
         font = ImageFont.load_default()
     tmp  = Image.new("L", (4000, px_h + 4), 0)
@@ -605,7 +610,8 @@ def _render_text_pixels(text, n_rows):
 
 def _replace_pixel_text(text, layer, grid_info,
                         color_rgba=None, size_factor=1.0,
-                        offset_x=0.0, offset_y=0.0):
+                        offset_x=0.0, offset_y=0.0,
+                        font_path=None):
     cell_w  = grid_info["cell_w"];  cell_h  = grid_info["cell_h"]
     shape_w = grid_info["shape_w"]; shape_h = grid_info["shape_h"]
     all_x   = grid_info["all_x"];   all_y   = grid_info["all_y"]
@@ -615,7 +621,7 @@ def _replace_pixel_text(text, layer, grid_info,
     if color_rgba:
         fl = dict(fl)
         fl["c"] = {"a": 0, "k": color_rgba, "ix": 2}
-    lit, n_cols = _render_text_pixels(text, grid_info["n_rows"])
+    lit, n_cols = _render_text_pixels(text, grid_info["n_rows"], font_path)
     x_origin = (all_x[0] + all_x[-1]) / 2 - (n_cols / 2) * cell_w + offset_x
     y_origin = all_y[0] + offset_y
     hw = shape_w / 2; hh = shape_h / 2
@@ -646,16 +652,9 @@ def _replace_pixel_text(text, layer, grid_info,
                         for col, row in lit] + [orig_outer_tr]
 
 
-# ─── Разделение на части ────────────────────────────────────────────────────
+# ─── Перекраска ─────────────────────────────────────────────────────────────
 
 def _detect_parts(data):
-    """
-    Разбирает стикер на части ПО ПОРЯДКУ СЛОЁВ:
-      bg      — самый НИЖНИЙ слой с заливками (фон, плашка сзади)
-      shape   — все СРЕДНИЕ слои (персонаж)
-      outline — обводки (st/gs) в средних слоях
-      text    — заливки в текстовых слоях (вписанные буквы)
-    """
     layers = data.get("layers", [])
     if not layers:
         return {"bg": [], "outline": [], "text": [], "shape": []}
@@ -677,7 +676,6 @@ def _detect_parts(data):
                 out_fills.append(item)
             elif ty in ("st", "gs"):
                 out_strokes.append(item)
-
             for k in ("it", "shapes"):
                 if k in item and isinstance(item[k], list):
                     for v in item[k]:
@@ -694,13 +692,11 @@ def _detect_parts(data):
                 collect_fills_strokes(sh, fills, strokes)
         layer_fills.append(fills)
         layer_strokes.append(strokes)
-
         is_text = False
         if layer.get("shapes"):
             is_text = id(layer["shapes"][0]) in text_layer_ids
         layer_is_text.append(is_text)
 
-    # Фон — нижний слой с заливками (не текстовый)
     bg = []
     bg_index = None
     for i in range(len(layers) - 1, -1, -1):
@@ -709,13 +705,11 @@ def _detect_parts(data):
             bg_index = i
             break
 
-    # Текст
     text_objs = []
     for i, layer in enumerate(layers):
         if layer_is_text[i]:
             text_objs.extend(layer_fills[i])
 
-    # Персонаж + контур
     shape_objs = []
     outline_objs = []
     for i, layer in enumerate(layers):
@@ -727,12 +721,8 @@ def _detect_parts(data):
         shape_objs.extend(layer_fills[i])
         outline_objs.extend(layer_strokes[i])
 
-    return {
-        "bg":      bg,
-        "shape":   shape_objs,
-        "outline": outline_objs,
-        "text":    text_objs,
-    }
+    return {"bg": bg, "shape": shape_objs,
+            "outline": outline_objs, "text": text_objs}
 
 
 def _apply_color_to_parts(parts, color_rgba):
@@ -754,10 +744,11 @@ def generate_sticker(text: str, template_path: str, output_path: str,
                      shape_color: str | None = None,
                      outline_color: str | None = None,
                      text_color: str | None = None,
+                     font_path: str | None = None,
                      size: float = 1.0,
                      offset_x: float = 0.0,
                      offset_y: float = 0.0) -> None:
-    _load_font()
+    _load_font(font_path)
 
     if color and not bg_color:      bg_color = color
     if color and not shape_color:   shape_color = color
@@ -782,19 +773,22 @@ def generate_sticker(text: str, template_path: str, output_path: str,
                                 color_rgba=text_rgba,
                                 size_factor=size,
                                 offset_x=offset_x,
-                                offset_y=offset_y)
+                                offset_y=offset_y,
+                                font_path=font_path)
         elif ltype == LAYER_TYPE_BLOB:
             _replace_blob_text(text, text_layer, extra,
                                color_rgba=text_rgba,
                                size_factor=size,
                                offset_x=offset_x,
-                               offset_y=offset_y)
+                               offset_y=offset_y,
+                               font_path=font_path)
         elif ltype == LAYER_TYPE_PIXEL:
             _replace_pixel_text(text, text_layer, extra,
                                 color_rgba=text_rgba,
                                 size_factor=size,
                                 offset_x=offset_x,
-                                offset_y=offset_y)
+                                offset_y=offset_y,
+                                font_path=font_path)
 
     if bg_rgba or shape_rgba or outline_rgba:
         parts = _detect_parts(data)

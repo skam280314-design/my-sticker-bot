@@ -5,3 +5,4 @@ Pillow
 rlottie-python
 httpx
 Flask
+libsql-experimental
