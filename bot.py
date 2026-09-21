@@ -182,12 +182,24 @@ def db_init():
 
 
 def _row_get(row, idx, key=None):
-    """libsql-client возвращает ResultSet. rows — список кортежей или dict."""
-    if isinstance(row, dict):
-        return row.get(key) if key else row
-    if isinstance(row, (list, tuple)):
+    """libsql-client возвращает Row — у него есть доступ по индексу и по имени."""
+    # Row поддерживает и индекс, и имя
+    if key is not None:
+        try:
+            return row[key]
+        except (KeyError, TypeError, IndexError):
+            pass
+    try:
         return row[idx]
-    return row
+    except (KeyError, TypeError, IndexError):
+        pass
+    # Если совсем непонятно — пробуем как атрибут
+    if key:
+        try:
+            return getattr(row, key)
+        except AttributeError:
+            pass
+    return None
 
 
 def remember_user(user):
@@ -217,7 +229,19 @@ def get_balance(user_id: int) -> int:
     rs = db_exec("SELECT balance FROM users WHERE user_id = ?", (user_id,))
     if not rs.rows:
         return 0
-    return int(_row_get(rs.rows[0], 0, "balance") or 0)
+    row = rs.rows[0]
+    # libsql-client Row поддерживает и [idx], и [name]
+    try:
+        val = row["balance"]
+    except (KeyError, TypeError, IndexError):
+        try:
+            val = row[0]
+        except (KeyError, TypeError, IndexError):
+            val = 0
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
 
 
 def add_balance(user_id: int, amount: int):
