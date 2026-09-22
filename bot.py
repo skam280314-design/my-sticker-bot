@@ -298,11 +298,11 @@ def count_users() -> int:
         return 0
 
 
-def list_users(limit: int = 50):
+def list_users(limit: int = 50, offset: int = 0):
     rs = db_exec("""
         SELECT user_id, username, first_name, balance
-        FROM users ORDER BY user_id LIMIT ?
-    """, (limit,))
+        FROM users ORDER BY user_id LIMIT ? OFFSET ?
+    """, (limit, offset))
     return rs.rows
 
 
@@ -497,7 +497,7 @@ def _admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика", callback_data="adm_stats")],
         [InlineKeyboardButton("⭐ Выдать звёзды", callback_data="adm_give_stars")],
-        [InlineKeyboardButton("👥 Пользователи", callback_data="adm_users")],
+        [InlineKeyboardButton("👥 Пользователи", callback_data="adm_users:0")],
         [InlineKeyboardButton("📢 Рассылка", callback_data="adm_broadcast")],
         [InlineKeyboardButton("🎟 Промокоды", callback_data="adm_promo")],
         [InlineKeyboardButton("📁 Файлы shared", callback_data="adm_files")],
@@ -924,6 +924,53 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                        reply_markup=_admin_keyboard())
             return
 
+        # ─── Пагинация пользователей ────────────────────────────────────────
+        if data.startswith("adm_users:"):
+            try:
+                page = int(data.split(":", 1)[1])
+            except (IndexError, ValueError):
+                page = 0
+
+            per_page = 20
+            total = count_users()
+            pages = max(1, (total + per_page - 1) // per_page)
+            page = max(0, min(page, pages - 1))
+            offset = page * per_page
+
+            rows = list_users(per_page, offset)
+            if not rows and page == 0:
+                await q.message.reply_text("👥 Пользователей нет.",
+                                           reply_markup=_admin_keyboard())
+                return
+
+            lines = [f"👥 <b>Пользователи</b> · стр. {page+1}/{pages}",
+                     f"Всего: <b>{total}</b>\n"]
+            for i, r in enumerate(rows, start=offset + 1):
+                uid = _val(r, 0, "user_id")
+                uname = _val(r, 1, "username") or ""
+                fname = _val(r, 2, "first_name") or ""
+                bal = _val(r, 3, "balance") or 0
+                uname_str = f"@{uname}" if uname else "—"
+                fname_short = (fname[:20] + "…") if len(fname) > 20 else fname
+                lines.append(f"{i}. <code>{uid}</code> · {uname_str} · "
+                             f"{fname_short} · ⭐ {bal}")
+
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("⬅️", callback_data=f"adm_users:{page-1}"))
+            nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
+            if page < pages - 1:
+                nav.append(InlineKeyboardButton("➡️", callback_data=f"adm_users:{page+1}"))
+
+            kb_rows = []
+            if nav:
+                kb_rows.append(nav)
+            kb_rows.append([InlineKeyboardButton("⬅️ В админку", callback_data="admin")])
+
+            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                       reply_markup=InlineKeyboardMarkup(kb_rows))
+            return
+
         if data == "adm_give_stars":
             await q.message.reply_text(
                 "⭐ <b>Выдача звёзд</b>\nВыбери режим:",
@@ -957,24 +1004,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("🛠 Отмена", callback_data="admin")]]))
             return
 
-        if data == "adm_users":
-            rows = list_users(50)
-            if not rows:
-                await q.message.reply_text("👥 Пользователей нет.",
-                                           reply_markup=_admin_keyboard())
-                return
-            lines = ["👥 <b>Пользователи</b>\n"]
-            for r in rows:
-                uid = _val(r, 0, "user_id")
-                uname = _val(r, 1, "username") or "—"
-                bal = _val(r, 3, "balance") or 0
-                lines.append(f"• <code>{uid}</code> · @{uname} · ⭐ {bal}")
-            if count_users() > 50:
-                lines.append(f"\n…и ещё {count_users() - 50}")
-            await q.message.reply_text("\n".join(lines), parse_mode="HTML",
-                                       reply_markup=_admin_keyboard())
-            return
-
         if data == "adm_broadcast":
             ctx.user_data["awaiting_broadcast"] = True
             await q.message.reply_text(
@@ -995,7 +1024,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "➕ <b>Создание промокода</b>\n\n"
                 "Формат: <code>КОД ЗВЁЗДЫ [ЛИМИТ]</code>\n"
                 "Пример: <code>HELLO 10</code>\n"
-                "Пример: <code>SUMMER 20 100</code>\n"
                 "Случайный код: <code>random 10</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
@@ -1156,14 +1184,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=_main_menu(user_id))
         return
 
-    # ─── Промокод ───────────────────────────────────────────────────────────
     if ctx.user_data.get("awaiting_promo"):
         ctx.user_data["awaiting_promo"] = False
         ok, msg = promo_apply(text.upper().strip(), user_id)
         await update.message.reply_text(msg, reply_markup=_main_menu(user_id))
         return
 
-    # ─── Админ: создание промокода ──────────────────────────────────────────
     if ctx.user_data.get("awaiting_promo_create") and is_admin(user_id):
         ctx.user_data["awaiting_promo_create"] = False
         parts = text.split()
@@ -1188,7 +1214,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=_promo_keyboard())
         return
 
-    # ─── Админ: удаление промокода ──────────────────────────────────────────
     if ctx.user_data.get("awaiting_promo_delete") and is_admin(user_id):
         ctx.user_data["awaiting_promo_delete"] = False
         code = text.upper().strip()
@@ -1198,7 +1223,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML", reply_markup=_promo_keyboard())
         return
 
-    # ─── Админ: выдача звёзд ────────────────────────────────────────────────
     mode = ctx.user_data.get("awaiting_give_stars")
     if mode and is_admin(user_id):
         if mode == "all":
@@ -1268,19 +1292,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=_admin_keyboard())
         return
 
-    # ─── Админ: рассылка ────────────────────────────────────────────────────
     if ctx.user_data.get("awaiting_broadcast") and is_admin(user_id):
         ctx.user_data["awaiting_broadcast"] = False
         sent, failed = 0, 0
+        errors = []
         for uid in get_all_user_ids():
             try:
                 await ctx.bot.send_message(uid, text)
                 sent += 1
-            except Exception:
+            except Exception as e:
                 failed += 1
-        await update.message.reply_text(
-            f"📢 Отправлено: {sent}, ошибок: {failed}.",
-            reply_markup=_admin_keyboard())
+                errors.append(f"• <code>{uid}</code>: {str(e)[:60]}")
+        result = f"📢 Отправлено: {sent}, ошибок: {failed}."
+        if errors:
+            result += "\n\n<b>Ошибки:</b>\n" + "\n".join(errors[:20])
+            if len(errors) > 20:
+                result += f"\n…и ещё {len(errors) - 20}"
+        await update.message.reply_text(result, parse_mode="HTML",
+                                        reply_markup=_admin_keyboard())
         return
 
     if not await check_subscription(ctx.bot, user_id):
@@ -1291,7 +1320,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/"):
         return
 
-    # ─── Создание пака ──────────────────────────────────────────────────────
     if ctx.user_data.get("awaiting_pack_name"):
         ctx.user_data["awaiting_pack_name"] = False
         generated = ctx.user_data.get("generated_files", [])
@@ -1336,7 +1364,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ Ошибка: {e}")
         return
 
-    # ─── Генерация стикеров ─────────────────────────────────────────────────
     if len(text) > 12:
         await update.message.reply_text(f"Слишком длинный текст ({len(text)}).")
         return
