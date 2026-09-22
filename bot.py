@@ -585,6 +585,13 @@ def _font_keyboard():
     return InlineKeyboardMarkup(rows)
 
 
+def _pay_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить оплату", callback_data="pay_confirm")],
+        [InlineKeyboardButton("❌ Отмена",             callback_data="pay_cancel")],
+    ])
+
+
 def _pack_action_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 Создать пак", callback_data="create_pack")],
@@ -644,6 +651,85 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not await check_subscription(ctx.bot, user_id):
         await q.answer("❌ Сначала подпишитесь на канал", show_alert=True)
+        return
+
+    # ─── Подтверждение оплаты ───────────────────────────────────────────────
+    if data == "pay_confirm":
+        await q.answer("Генерирую...")
+
+        text        = ctx.user_data.get("pending_text")
+        cat         = ctx.user_data.get("pending_cat")
+        selected    = ctx.user_data.get("pending_selected", [])
+        font_path   = ctx.user_data.get("pending_font")
+        total_price = ctx.user_data.get("pending_price", 0)
+
+        if not text or not cat or not selected or not font_path:
+            await q.message.reply_text("❌ Данные потерялись. Начни заново.",
+                                       reply_markup=_main_menu(user_id))
+            return
+
+        is_adm = is_admin(user_id)
+        if not is_adm and total_price > 0:
+            if not spend_balance(user_id, total_price):
+                await q.message.reply_text(
+                    f"❌ Не хватает звёзд.\n\n"
+                    f"Нужно: {total_price} ⭐\n"
+                    f"У тебя: {get_balance(user_id)} ⭐",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⭐ Пополнить", callback_data="topup")],
+                        [InlineKeyboardButton("🏠 В меню", callback_data="main")],
+                    ]))
+                return
+
+        msg = await q.message.reply_text(
+            f"⚙️ Генерирую {len(selected)} стикер(ов)...")
+        try:
+            templates = _category_templates(cat)
+            out_files = []
+            for idx_global in selected:
+                if idx_global >= len(templates):
+                    continue
+                _, path = templates[idx_global]
+                with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
+                    out_path = tmp.name
+                generate_sticker(text, str(path), out_path, font_path=font_path)
+                out_files.append(out_path)
+
+            for f_path in out_files:
+                with open(f_path, "rb") as f:
+                    await q.message.reply_sticker(sticker=f)
+                add_set(user_id, f_path, text, "multi")
+
+            ctx.user_data["generated_files"] = out_files
+            await msg.delete()
+            inc_generated(user_id)
+            stat_inc("generated")
+
+            await q.message.reply_text(
+                f"✅ Готово! Списано {total_price} ⭐\n"
+                f"⭐ Баланс: {get_balance(user_id)}\n\n"
+                f"Хочешь собрать всё в пак?",
+                reply_markup=_pack_action_keyboard())
+
+            for k in ("pending_text", "pending_cat", "pending_selected",
+                      "pending_font", "pending_price"):
+                ctx.user_data.pop(k, None)
+            ctx.user_data["selected_templates"] = []
+
+        except Exception as e:
+            if not is_adm and total_price > 0:
+                add_balance(user_id, total_price)
+            logger.exception("Ошибка генерации")
+            await msg.edit_text(f"❌ Ошибка: {e}\nБаланс возвращён.")
+        return
+
+    if data == "pay_cancel":
+        await q.answer("Отменено")
+        for k in ("pending_text", "pending_cat", "pending_selected",
+                  "pending_font", "pending_price"):
+            ctx.user_data.pop(k, None)
+        await q.message.edit_text("❌ Отменено.",
+                                  reply_markup=_main_menu(user_id))
         return
 
     # ─── Промокод ───────────────────────────────────────────────────────────
@@ -874,7 +960,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         await q.message.reply_text(
             "ℹ️ 1. Выбери категорию.\n2. Отметь шаблоны (✅).\n3. «Далее».\n"
-            "4. Выбери шрифт.\n5. Напиши текст.\n6. Получи стикеры или создай пак.",
+            "4. Выбери шрифт.\n5. Напиши текст.\n"
+            "6. Подтверди оплату — стикеры сгенерируются.\n"
+            "7. Опционально — собери всё в пак.",
             reply_markup=_back_menu())
         return
 
@@ -924,7 +1012,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                        reply_markup=_admin_keyboard())
             return
 
-        # ─── Пагинация пользователей ────────────────────────────────────────
         if data.startswith("adm_users:"):
             try:
                 page = int(data.split(":", 1)[1])
@@ -1320,6 +1407,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/"):
         return
 
+    # ─── Создание пака ──────────────────────────────────────────────────────
     if ctx.user_data.get("awaiting_pack_name"):
         ctx.user_data["awaiting_pack_name"] = False
         generated = ctx.user_data.get("generated_files", [])
@@ -1364,6 +1452,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ Ошибка: {e}")
         return
 
+    # ─── Текст: подтверждение оплаты ────────────────────────────────────────
     if len(text) > 12:
         await update.message.reply_text(f"Слишком длинный текст ({len(text)}).")
         return
@@ -1384,54 +1473,32 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     is_adm = is_admin(user_id)
-    total_price = PRICE_STARS * len(selected)
-    if not is_adm:
-        if not spend_balance(user_id, total_price):
-            await update.message.reply_text(
-                f"❌ Не хватает звёзд. Нужно: {total_price} ⭐",
-                reply_markup=_main_menu(user_id))
-            return
+    total_price = 0 if is_adm else PRICE_STARS * len(selected)
 
-    msg = await update.message.reply_text(
-        f"⚙️ Генерирую {len(selected)} стикер(ов)...")
-    try:
-        templates = _category_templates(cat)
-        out_files = []
-        for idx_global in selected:
-            if idx_global >= len(templates):
-                continue
-            _, path = templates[idx_global]
-            with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
-                out_path = tmp.name
-            generate_sticker(text, str(path), out_path, font_path=font_path)
-            out_files.append(out_path)
+    ctx.user_data["pending_text"]     = text
+    ctx.user_data["pending_cat"]      = cat
+    ctx.user_data["pending_selected"] = list(selected)
+    ctx.user_data["pending_font"]     = font_path
+    ctx.user_data["pending_price"]    = total_price
 
-        for f_path in out_files:
-            with open(f_path, "rb") as f:
-                await update.message.reply_sticker(sticker=f)
-            add_set(user_id, f_path, text, "multi")
-
-        ctx.user_data["generated_files"] = out_files
-        await msg.delete()
-        inc_generated(user_id)
-        stat_inc("generated")
-
-        await update.message.reply_text(
-            f"✅ Готово! Списано {total_price} ⭐\n"
-            f"⭐ Баланс: {get_balance(user_id)}\n\nХочешь собрать всё в пак?",
-            reply_markup=_pack_action_keyboard())
-
-        ctx.user_data["selected_templates"] = []
-    except Exception as e:
-        logger.exception("Ошибка генерации")
-        await msg.edit_text(f"❌ Ошибка: {e}")
+    price_line = "бесплатно (админ)" if is_adm else f"{total_price} ⭐"
+    await update.message.reply_text(
+        f"💳 <b>Подтверждение оплаты</b>\n\n"
+        f"✏️ Текст: <b>{text}</b>\n"
+        f"🎨 Стикеров: <b>{len(selected)}</b>\n"
+        f"💰 Стоимость: <b>{price_line}</b>\n\n"
+        f"После подтверждения спишутся звёзды и начнётся генерация.",
+        parse_mode="HTML",
+        reply_markup=_pay_confirm_keyboard())
+    return
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for k in ("awaiting_font", "awaiting_pack_name", "pending_text",
               "awaiting_promo", "awaiting_promo_create",
               "awaiting_promo_delete", "awaiting_broadcast",
-              "awaiting_give_stars"):
+              "awaiting_give_stars", "pending_cat", "pending_selected",
+              "pending_font", "pending_price"):
         ctx.user_data.pop(k, None)
     ctx.user_data["selected_templates"] = []
     ctx.user_data.pop("selected_cat", None)
